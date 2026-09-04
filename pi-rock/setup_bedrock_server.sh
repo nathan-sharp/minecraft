@@ -207,18 +207,29 @@ create_system_user() {
 # ------------------------------------------------------------------------------
 download_bedrock_server() {
     log_info "Resolving latest official Minecraft Bedrock Server package..."
-    local download_page_html
     local download_url=""
+    local api_url="https://net-secondary.web.minecraft-services.net/api/v1.0/download/links"
 
-    download_page_html="$(curl -s -L -A "${MOJANG_USER_AGENT}" "${MOJANG_DOWNLOAD_URL}" || true)"
-    if [[ -n "${download_page_html}" ]]; then
-        download_url="$(echo "${download_page_html}" | grep -oE 'https://[^"]+bin-linux/bedrock-server-[^"]+\.zip' | head -n 1 || true)"
+    # Strategy 1: Official Mojang services API endpoint
+    local api_json
+    api_json="$(curl -s -L "${api_url}" || true)"
+    if [[ -n "${api_json}" ]]; then
+        download_url="$(echo "${api_json}" | grep -oE 'https://[^"]+bin-linux/bedrock-server-[^"]+\.zip' | head -n 1 || true)"
     fi
 
+    # Strategy 2: Official download page scrape
+    if [[ -z "${download_url}" ]]; then
+        local download_page_html
+        download_page_html="$(curl -s -L -A "${MOJANG_USER_AGENT}" "${MOJANG_DOWNLOAD_URL}" || true)"
+        if [[ -n "${download_page_html}" ]]; then
+            download_url="$(echo "${download_page_html}" | grep -oE 'https://[^"]+bin-linux/bedrock-server-[^"]+\.zip' | head -n 1 || true)"
+        fi
+    fi
+
+    # Strategy 3: Verified active production fallback URL
     if [[ -z "${download_url}" ]]; then
         log_warn "Automated download URL extraction failed. Fetching fallback BDS link..."
-        # Static verified fallback URL format
-        download_url="https://minecraft.azureedge.net/bin-linux/bedrock-server-1.21.2.02.zip"
+        download_url="https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-1.26.45.1.zip"
     fi
 
     log_info "Downloading server archive from: ${download_url}"
@@ -357,18 +368,24 @@ if [[ "$(id -u)" -ne 0 ]]; then
     exit 1
 fi
 
-MOJANG_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-PAGE_URL="https://www.minecraft.net/en-us/download/server/bedrock"
-INSTALL_PATH="/opt/minecraft/bedrock"
+    MOJANG_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+    API_URL="https://net-secondary.web.minecraft-services.net/api/v1.0/download/links"
+    PAGE_URL="https://www.minecraft.net/en-us/download/server/bedrock"
+    INSTALL_PATH="/opt/minecraft/bedrock"
 
-echo "[INFO] Checking for Bedrock server updates..."
-HTML="$(curl -s -L -A "${MOJANG_UA}" "${PAGE_URL}" || true)"
-DOWNLOAD_URL="$(echo "${HTML}" | grep -oE 'https://[^"]+bin-linux/bedrock-server-[^"]+\.zip' | head -n 1 || true)"
+    echo "[INFO] Checking for Bedrock server updates..."
+    API_JSON="$(curl -s -L "${API_URL}" || true)"
+    DOWNLOAD_URL="$(echo "${API_JSON}" | grep -oE 'https://[^"]+bin-linux/bedrock-server-[^"]+\.zip' | head -n 1 || true)"
 
-if [[ -z "${DOWNLOAD_URL}" ]]; then
-    echo "[ERROR] Failed to obtain download link from Mojang." >&2
-    exit 1
-fi
+    if [[ -z "${DOWNLOAD_URL}" ]]; then
+        HTML="$(curl -s -L -A "${MOJANG_UA}" "${PAGE_URL}" || true)"
+        DOWNLOAD_URL="$(echo "${HTML}" | grep -oE 'https://[^"]+bin-linux/bedrock-server-[^"]+\.zip' | head -n 1 || true)"
+    fi
+
+    if [[ -z "${DOWNLOAD_URL}" ]]; then
+        echo "[ERROR] Failed to obtain download link from Mojang." >&2
+        exit 1
+    fi
 
 echo "[INFO] Stopping Minecraft Bedrock service..."
 systemctl stop minecraft-bedrock.service || true
