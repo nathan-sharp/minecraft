@@ -183,6 +183,16 @@ install_box64() {
     if ! command -v box64 >/dev/null 2>&1; then
         log_fatal "box64 installation failed. Command 'box64' not found in PATH."
     fi
+
+    local detected_box64
+    detected_box64="$(command -v box64)"
+    if [[ "${detected_box64}" != "/usr/bin/box64" && ! -e "/usr/bin/box64" ]]; then
+        ln -sf "${detected_box64}" /usr/bin/box64
+    fi
+    if [[ "${detected_box64}" != "/usr/local/bin/box64" && ! -e "/usr/local/bin/box64" ]]; then
+        ln -sf "${detected_box64}" /usr/local/bin/box64
+    fi
+
     log_info "box64 successfully installed: $(box64 -v 2>&1 | head -n 1)"
 }
 
@@ -288,6 +298,9 @@ download_bedrock_server() {
 # ------------------------------------------------------------------------------
 install_systemd_service() {
     log_info "Generating systemd service definition: ${SERVICE_FILE}..."
+    local box64_exec
+    box64_exec="$(command -v box64 || echo '/usr/local/bin/box64')"
+
     cat > "${SERVICE_FILE}" << EOF
 [Unit]
 Description=Minecraft Bedrock Dedicated Server
@@ -300,9 +313,10 @@ User=${SERVER_USER}
 Group=${SERVER_GROUP}
 WorkingDirectory=${INSTALL_DIR}
 Environment="LD_LIBRARY_PATH=${INSTALL_DIR}"
+Environment="BOX64_LD_LIBRARY_PATH=${INSTALL_DIR}"
 Environment="BOX64_NOBANNER=1"
 Environment="BOX64_DYNAREC=1"
-ExecStart=/usr/bin/box64 ${INSTALL_DIR}/bedrock_server
+ExecStart=${box64_exec} ${INSTALL_DIR}/bedrock_server
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=65535
@@ -519,13 +533,14 @@ configure_firewall() {
 # ------------------------------------------------------------------------------
 start_server_service() {
     log_info "Starting ${SERVICE_NAME}..."
-    systemctl start "${SERVICE_NAME}"
+    systemctl restart "${SERVICE_NAME}"
     sleep 3
 
     if systemctl is-active --quiet "${SERVICE_NAME}"; then
         log_info "Service ${SERVICE_NAME} is active and running."
     else
-        log_error "Service failed to start. Inspect logs using: journalctl -u ${SERVICE_NAME} -e"
+        log_error "Service failed to start. Recent service logs:"
+        journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || true
     fi
 }
 
