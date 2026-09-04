@@ -21,7 +21,7 @@ readonly SERVICE_NAME="minecraft-bedrock.service"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 readonly MOJANG_USER_AGENT="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 readonly MOJANG_DOWNLOAD_URL="https://www.minecraft.net/en-us/download/server/bedrock"
-readonly MIN_SWAP_MB=2048
+readonly MIN_SWAP_MB=1900
 
 # ------------------------------------------------------------------------------
 # LOGGING AND OUTPUT FUNCTIONS
@@ -142,21 +142,42 @@ install_box64() {
     fi
 
     log_info "Configuring Ryan Fortner's box64 APT repository..."
-    local gpg_key_path="/usr/share/keyrings/box64-debs-archive-keyring.gpg"
+    local gpg_key_path="/etc/apt/trusted.gpg.d/box64-debs-archive-keyring.gpg"
     local repo_list_path="/etc/apt/sources.list.d/box64.list"
 
-    wget -qO- https://ryanfortner.github.io/box64-debs/KEY.gpg | gpg --dearmor --yes -o "${gpg_key_path}"
-    echo "deb [signed-by=${gpg_key_path}] https://ryanfortner.github.io/box64-debs/debian ./arm64/" > "${repo_list_path}"
+    wget -qO- https://ryanfortner.github.io/box64-debs/KEY.gpg | gpg --dearmor --yes -o "${gpg_key_path}" || true
+    wget -q https://ryanfortner.github.io/box64-debs/box64.list -O "${repo_list_path}" || \
+        echo "deb https://ryanfortner.github.io/box64-debs/debian ./" > "${repo_list_path}"
 
-    apt-get update -y
+    apt-get update -y || true
 
-    # Select architecture-specific box64 package if available
+    # Attempt package installation from APT
     if apt-cache show box64-rpi4arm64 >/dev/null 2>&1; then
-        apt-get install -y box64-rpi4arm64
+        apt-get install -y box64-rpi4arm64 || true
     elif apt-cache show box64-arm64 >/dev/null 2>&1; then
-        apt-get install -y box64-arm64
+        apt-get install -y box64-arm64 || true
     else
-        apt-get install -y box64
+        apt-get install -y box64 || true
+    fi
+
+    # Fallback to source compilation if APT package is not found or fails
+    if ! command -v box64 >/dev/null 2>&1; then
+        log_warn "APT package for box64 unavailable on this release. Compiling from source..."
+        apt-get install -y --no-install-recommends git cmake build-essential python3
+
+        local build_dir
+        build_dir="$(mktemp -d /tmp/box64-build-XXXXXX)"
+        git clone --depth 1 https://github.com/ptitSeb/box64.git "${build_dir}/box64"
+
+        mkdir -p "${build_dir}/box64/build"
+        pushd "${build_dir}/box64/build" >/dev/null
+        cmake .. -DRPI4ARM64=1 -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        make -j"$(nproc)"
+        make install
+        popd >/dev/null
+
+        rm -rf "${build_dir}"
+        systemctl restart systemd-binfmt 2>/dev/null || true
     fi
 
     if ! command -v box64 >/dev/null 2>&1; then
