@@ -513,7 +513,146 @@ echo "[INFO] World storage successfully relocated to: ${TARGET_DIR}"
 EOF
     chmod 755 /usr/local/bin/mc-set-storage
 
-    log_info "Administrative tools installed: /usr/local/bin/mc-backup, /usr/local/bin/mc-update, /usr/local/bin/mc-set-storage"
+    # 4. mc-allowlist tool (manages Bedrock server allowlist)
+    cat > /usr/local/bin/mc-allowlist << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "[ERROR] This tool must execute with root privileges: sudo mc-allowlist <COMMAND> [ARGS]" >&2
+    exit 1
+fi
+
+INSTALL_PATH="/opt/minecraft/bedrock"
+ALLOWLIST_FILE="${INSTALL_PATH}/allowlist.json"
+SERVER_PROPS="${INSTALL_PATH}/server.properties"
+
+show_usage() {
+    echo "Usage: sudo mc-allowlist <COMMAND> [GAMERTAG]"
+    echo ""
+    echo "Commands:"
+    echo "  add <GAMERTAG>     Add an Xbox Gamertag to the allowlist"
+    echo "  remove <GAMERTAG>  Remove an Xbox Gamertag from the allowlist"
+    echo "  list               List all authorized Gamertags in allowlist.json"
+    echo "  on                 Enable allowlist enforcement in server.properties"
+    echo "  off                Disable allowlist enforcement in server.properties"
+    echo "  reload             Restart server to apply allowlist changes"
+    exit 1
+}
+
+if [[ $# -lt 1 ]]; then
+    show_usage
+fi
+
+COMMAND="$1"
+
+# Ensure allowlist.json exists
+if [[ ! -f "${ALLOWLIST_FILE}" ]]; then
+    echo "[]" > "${ALLOWLIST_FILE}"
+    chown mcserver:mcserver "${ALLOWLIST_FILE}"
+    chmod 640 "${ALLOWLIST_FILE}"
+fi
+
+case "${COMMAND}" in
+    add)
+        if [[ $# -lt 2 ]]; then
+            echo "[ERROR] Missing Gamertag. Usage: sudo mc-allowlist add <GAMERTAG>" >&2
+            exit 1
+        fi
+        GAMERTAG="$2"
+        python3 -c "
+import json, sys
+path = '${ALLOWLIST_FILE}'
+tag = sys.argv[1]
+try:
+    with open(path, 'r') as f:
+        data = json.load(f)
+except Exception:
+    data = []
+if not any(entry.get('name', '').lower() == tag.lower() for entry in data):
+    data.append({'name': tag, 'ignoresPlayerLimit': False})
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f'[INFO] Added \'{tag}\' to allowlist.')
+else:
+    print(f'[INFO] Player \'{tag}\' is already in allowlist.')
+" "${GAMERTAG}"
+        chown mcserver:mcserver "${ALLOWLIST_FILE}"
+        chmod 640 "${ALLOWLIST_FILE}"
+        echo "[INFO] Restarting server to apply changes..."
+        systemctl restart minecraft-bedrock.service
+        ;;
+    remove)
+        if [[ $# -lt 2 ]]; then
+            echo "[ERROR] Missing Gamertag. Usage: sudo mc-allowlist remove <GAMERTAG>" >&2
+            exit 1
+        fi
+        GAMERTAG="$2"
+        python3 -c "
+import json, sys
+path = '${ALLOWLIST_FILE}'
+tag = sys.argv[1]
+try:
+    with open(path, 'r') as f:
+        data = json.load(f)
+except Exception:
+    data = []
+new_data = [entry for entry in data if entry.get('name', '').lower() != tag.lower()]
+with open(path, 'w') as f:
+    json.dump(new_data, f, indent=2)
+print(f'[INFO] Removed \'{tag}\' from allowlist.')
+" "${GAMERTAG}"
+        chown mcserver:mcserver "${ALLOWLIST_FILE}"
+        chmod 640 "${ALLOWLIST_FILE}"
+        echo "[INFO] Restarting server to apply changes..."
+        systemctl restart minecraft-bedrock.service
+        ;;
+    list)
+        python3 -c "
+import json
+path = '${ALLOWLIST_FILE}'
+try:
+    with open(path, 'r') as f:
+        data = json.load(f)
+    print('Authorized Players:')
+    for i, entry in enumerate(data, 1):
+        print(f'  {i}. {entry.get(\"name\", \"unknown\")} (IgnoresLimit: {entry.get(\"ignoresPlayerLimit\", False)})')
+    if not data:
+        print('  (No players currently allowlisted)')
+except Exception as e:
+    print(f'[ERROR] Could not read allowlist: {e}')
+"
+        ;;
+    on)
+        if grep -q "^allow-list=" "${SERVER_PROPS}"; then
+            sed -i 's/^allow-list=.*/allow-list=true/' "${SERVER_PROPS}"
+        else
+            echo "allow-list=true" >> "${SERVER_PROPS}"
+        fi
+        echo "[INFO] Allowlist enforcement ENABLED in server.properties."
+        systemctl restart minecraft-bedrock.service
+        ;;
+    off)
+        if grep -q "^allow-list=" "${SERVER_PROPS}"; then
+            sed -i 's/^allow-list=.*/allow-list=false/' "${SERVER_PROPS}"
+        else
+            echo "allow-list=false" >> "${SERVER_PROPS}"
+        fi
+        echo "[INFO] Allowlist enforcement DISABLED in server.properties."
+        systemctl restart minecraft-bedrock.service
+        ;;
+    reload)
+        systemctl restart minecraft-bedrock.service
+        echo "[INFO] Server reloaded."
+        ;;
+    *)
+        show_usage
+        ;;
+esac
+EOF
+    chmod 755 /usr/local/bin/mc-allowlist
+
+    log_info "Administrative tools installed: /usr/local/bin/mc-backup, /usr/local/bin/mc-update, /usr/local/bin/mc-set-storage, /usr/local/bin/mc-allowlist"
 }
 
 # ------------------------------------------------------------------------------
@@ -577,13 +716,14 @@ main() {
     printf " Backup Directory        : %s\n" "${BACKUP_DIR}"
     printf "\n"
     printf " Management Commands:\n"
-    printf "   Status  : systemctl status %s\n" "${SERVICE_NAME}"
-    printf "   Logs    : journalctl -u %s -f\n" "${SERVICE_NAME}"
-    printf "   Stop    : sudo systemctl stop %s\n" "${SERVICE_NAME}"
-    printf "   Start   : sudo systemctl start %s\n" "${SERVICE_NAME}"
-    printf "   Storage : sudo mc-set-storage <PATH>\n"
-    printf "   Backup  : sudo mc-backup\n"
-    printf "   Update  : sudo mc-update\n"
+    printf "   Status    : systemctl status %s\n" "${SERVICE_NAME}"
+    printf "   Logs      : journalctl -u %s -f\n" "${SERVICE_NAME}"
+    printf "   Stop      : sudo systemctl stop %s\n" "${SERVICE_NAME}"
+    printf "   Start     : sudo systemctl start %s\n" "${SERVICE_NAME}"
+    printf "   Allowlist : sudo mc-allowlist add <GAMERTAG>\n"
+    printf "   Storage   : sudo mc-set-storage <PATH>\n"
+    printf "   Backup    : sudo mc-backup\n"
+    printf "   Update    : sudo mc-update\n"
     printf "====================================================================\n"
 }
 

@@ -244,6 +244,59 @@ The installer provisions a dedicated utility at `/usr/local/bin/mc-set-storage` 
    sudo mc-set-storage
    ```
 
+### 7.5 Allowlist and Access Control Management
+
+The server includes an allowlist to restrict access to approved Xbox Gamertags.
+
+#### Method 1: Using the Automated Helper Tool (`mc-allowlist`)
+
+The installer provisions `/usr/local/bin/mc-allowlist` to manage player access:
+
+1. Enable allowlist enforcement:
+   ```bash
+   sudo mc-allowlist on
+   ```
+2. Add an authorized Xbox Gamertag:
+   ```bash
+   sudo mc-allowlist add "YourGamertag"
+   ```
+3. View all currently allowlisted players:
+   ```bash
+   sudo mc-allowlist list
+   ```
+4. Remove a player from the allowlist:
+   ```bash
+   sudo mc-allowlist remove "YourGamertag"
+   ```
+5. Disable allowlist enforcement (allows all players):
+   ```bash
+   sudo mc-allowlist off
+   ```
+
+#### Method 2: Manual JSON Configuration
+
+1. Open `/opt/minecraft/bedrock/allowlist.json` in a text editor:
+   ```bash
+   sudo nano /opt/minecraft/bedrock/allowlist.json
+   ```
+2. Add player objects with exact Xbox Gamertags:
+   ```json
+   [
+     {
+       "name": "PlayerOneGamertag",
+       "ignoresPlayerLimit": false
+     },
+     {
+       "name": "PlayerTwoGamertag",
+       "ignoresPlayerLimit": false
+     }
+   ]
+   ```
+3. Save the file and restart the server daemon:
+   ```bash
+   sudo systemctl restart minecraft-bedrock.service
+   ```
+
 ---
 
 ## 8. Server Configuration Reference
