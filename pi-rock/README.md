@@ -150,6 +150,66 @@ To allow external players to connect over the Wide Area Network (WAN), configure
 8. Set the **Internal IP Address** to the static IP address of your Raspberry Pi.
 9. Save and apply the configuration.
 
+### 6.3 Custom Domain Configuration via Cloudflare DNS
+
+Standard Cloudflare Tunnels (`cloudflared`) do not support inbound User Datagram Protocol (UDP) game traffic for public players. Minecraft Bedrock Edition uses UDP exclusively (port 19132).
+
+To connect a custom domain to your Minecraft server, use **Cloudflare DNS** with an unproxied `A` record combined with standard router port forwarding.
+
+#### Procedure: Configuring Cloudflare DNS
+
+1. Log in to the [Cloudflare Dashboard](https://dash.cloudflare.com/).
+2. Select your registered domain name.
+3. Navigate to **DNS** -> **Records**.
+4. Click **Add record**.
+5. Set **Type** to `A`.
+6. Set **Name** to `bedrock` (or your preferred subdomain, e.g., `mc`).
+7. Set **IPv4 address** to your public WAN IPv4 address.
+8. Set **Proxy status** to **DNS only** (Grey Cloud icon).
+9. Set **TTL** to `Auto`.
+10. Click **Save**.
+
+Players can now join the server by entering `bedrock.yourdomain.com` and port `19132`.
+
+```
++----------------------------------------------------------------+
+| Minecraft Bedrock Client                                       |
+| Server Address: bedrock.yourdomain.com | Port: 19132           |
++----------------------------------------------------------------+
+                               |
+                               | 1. DNS Query: Resolves public IP via Cloudflare DNS
+                               v
++----------------------------------------------------------------+
+| Gateway Router (Public IP)                                     |
+| Port Forwarding Rule: UDP 19132 -> 192.168.0.36:19132          |
++----------------------------------------------------------------+
+                               |
+                               | 2. Direct UDP Packets
+                               v
++----------------------------------------------------------------+
+| Raspberry Pi (192.168.0.36)                                    |
+| Service: minecraft-bedrock.service (UDP 19132)                 |
++----------------------------------------------------------------+
+```
+
+### 6.4 Alternative: UDP Tunneling for CGNAT (Playit.gg)
+
+If your Internet Service Provider (ISP) uses Carrier-Grade NAT (CGNAT) and prevents router port forwarding, Cloudflare Tunnel cannot route Bedrock UDP. Use `playit.gg`, which natively tunnels UDP:
+
+1. Install the Playit CLI agent on your Raspberry Pi:
+   ```bash
+   curl -SsL https://playit-cloud.github.io/ppa/key.gpg | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/playit.gpg >/dev/null
+   echo "deb [signed-by=/etc/apt/trusted.gpg.d/playit.gpg] https://playit-cloud.github.io/ppa/data ./" | sudo tee /etc/apt/sources.list.d/playit.list
+   sudo apt-get update && sudo apt-get install -y playit
+   ```
+2. Start the Playit agent:
+   ```bash
+   sudo playit
+   ```
+3. Follow the claim URL displayed in the terminal to bind the agent to your account.
+4. Add a tunnel configured for **Minecraft Bedrock (UDP)** pointing to local port `19132`.
+5. Link your custom domain in the Playit web dashboard using a `CNAME` or `A` record.
+
 ---
 
 ## 7. Operations and System Management
