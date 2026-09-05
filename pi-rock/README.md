@@ -393,6 +393,33 @@ The installer provisions `/usr/local/bin/mc-allowlist` to manage player access:
    sudo systemctl restart minecraft-bedrock.service
    ```
 
+### 7.6 Web Administration Interface
+
+The toolkit deploys a lightweight, browser-based administration interface running via Python 3 on TCP port 8080.
+
+#### Features:
+- **Service Monitoring & Lifecycle**: Real-time daemon status with Start, Stop, Restart, and Backup triggers.
+- **World File Management**:
+  - Download the active live world as an `.mcworld` package directly to your computer.
+  - Upload existing worlds (`.mcworld`, `.zip`, `.tar.gz`) to replace the active server world with automatic pre-import safety backups.
+  - View all server backups with timestamps and file sizes.
+  - One-click backup file download, one-click restoration, and deletion.
+- **Configuration Editor**: Modify `server.properties` parameters with visual form controls.
+- **Allowlist Controls**: Add or remove authorized Xbox Gamertags.
+- **Security**: Protected with HTTP Basic Authentication and positive input validation.
+
+#### Procedure: Accessing the Web UI
+
+1. Open a web browser on any device on your local network.
+2. Navigate to:
+   ```text
+   http://<YOUR_RASPBERRY_PI_IP>:8080
+   ```
+3. Enter credentials when prompted:
+   - **Username**: `admin`
+   - **Password**: Found in `/opt/minecraft/webui/auth.json` (printed during setup).
+4. Manage worlds, edit configuration, or update allowlists directly from the interface.
+
 ---
 
 ## 8. Server Configuration Reference
