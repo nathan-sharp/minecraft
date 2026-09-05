@@ -210,6 +210,42 @@ If your Internet Service Provider (ISP) uses Carrier-Grade NAT (CGNAT) and preve
 4. Add a tunnel configured for **Minecraft Bedrock (UDP)** pointing to local port `19132`.
 5. Link your custom domain in the Playit web dashboard using a `CNAME` or `A` record.
 
+### 6.5 Port Forwarding Verification Procedure
+
+> [!WARNING]
+> **TCP vs. UDP Port Checking Tool Warning**
+>
+> Standard web port checking tools (e.g., CanYouSeeMe, YouGetSignal) only test Transmission Control Protocol (TCP). Minecraft Bedrock communicates over User Datagram Protocol (UDP). TCP checkers will report UDP port 19132 as "CLOSED" even when port forwarding operates correctly.
+
+#### Step 1: Verify Local Service Port Binding
+
+Execute this command on your Raspberry Pi to confirm `bedrock_server` listens on UDP port 19132:
+
+```bash
+sudo ss -ulnp | grep 19132
+```
+
+*Expected Output*: Displays an active UDP socket bound to `0.0.0.0:19132` or `*:19132`.
+
+#### Step 2: Test External Reachability via Bedrock Ping
+
+Use a specialized Minecraft Bedrock protocol scanner that transmits genuine RakNet UDP ping packets:
+
+1. Open a browser and visit [mcsrvstat.us Bedrock Checker](https://mcsrvstat.us/).
+2. Enter your public IP address or custom domain (e.g., `bedrock.yourdomain.com:19132`).
+3. Click **Get server status**.
+4. Verify the scanner returns **Online**, server version (`1.26.45.1`), and player slots.
+
+#### Step 3: Test Direct Connection via Cellular Network
+
+1. Disconnect a mobile smartphone from your local Wi-Fi network.
+2. Enable 4G/5G mobile cellular data.
+3. Open the Minecraft Bedrock application.
+4. Navigate to **Play** -> **Servers** -> **Add Server**.
+5. Set **Server Address** to your public IP or custom domain (`bedrock.yourdomain.com`).
+6. Set **Port** to `19132`.
+7. Join the server and confirm world generation.
+
 ---
 
 ## 7. Operations and System Management
