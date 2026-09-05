@@ -399,6 +399,13 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
 
 #### Features:
 - **Service Monitoring & Lifecycle**: Real-time daemon status with Start, Stop, Restart, and Backup triggers.
+- **Hardware & System Telemetry**:
+  - Primary root filesystem storage capacity, consumed space, free space, and utilization percentage.
+  - World storage filesystem capacity, consumed space, free space, and mount path (identifies USB storage).
+  - RAM memory metrics (total, used, available, and percentage utilized).
+  - Linux swap memory metrics (total, used, free, and percentage utilized).
+  - System on Chip (SoC) temperature in degrees Celsius (°C).
+  - Linux load averages (1-minute, 5-minute, and 15-minute intervals) and total system uptime.
 - **World File Management**:
   - Download the active live world as an `.mcworld` package directly to your computer.
   - Upload existing worlds (`.mcworld`, `.zip`, `.tar.gz`) to replace the active server world with automatic pre-import safety backups.

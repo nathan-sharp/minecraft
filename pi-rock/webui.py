@@ -156,6 +156,114 @@ def list_backups():
     return backups
 
 
+def get_active_worlds_dir():
+    """Resolve the real filesystem path for the worlds directory."""
+    worlds_path = os.path.join(BASE_DIR, "worlds")
+    if os.path.islink(worlds_path):
+        return os.path.realpath(worlds_path)
+    return worlds_path
+
+
+def get_device_stats():
+    """Collect hardware and operating system resource telemetry."""
+    stats = {}
+
+    # 1. Primary Root Storage Usage
+    try:
+        root_usage = shutil.disk_usage("/")
+        stats["root_total_gb"] = round(root_usage.total / (1024**3), 1)
+        stats["root_used_gb"] = round(root_usage.used / (1024**3), 1)
+        stats["root_free_gb"] = round(root_usage.free / (1024**3), 1)
+        stats["root_pct"] = round((root_usage.used / root_usage.total) * 100, 1)
+    except Exception:
+        stats["root_total_gb"] = 0
+        stats["root_used_gb"] = 0
+        stats["root_free_gb"] = 0
+        stats["root_pct"] = 0
+
+    # 2. World Storage Target Usage
+    try:
+        worlds_path = get_active_worlds_dir()
+        stats["worlds_path"] = worlds_path
+        worlds_usage = shutil.disk_usage(worlds_path)
+        stats["worlds_total_gb"] = round(worlds_usage.total / (1024**3), 1)
+        stats["worlds_used_gb"] = round(worlds_usage.used / (1024**3), 1)
+        stats["worlds_free_gb"] = round(worlds_usage.free / (1024**3), 1)
+        stats["worlds_pct"] = round((worlds_usage.used / worlds_usage.total) * 100, 1)
+        stats["is_external_worlds"] = os.path.islink(os.path.join(BASE_DIR, "worlds"))
+    except Exception:
+        stats["worlds_path"] = "/opt/minecraft/bedrock/worlds"
+        stats["worlds_total_gb"] = 0
+        stats["worlds_used_gb"] = 0
+        stats["worlds_free_gb"] = 0
+        stats["worlds_pct"] = 0
+        stats["is_external_worlds"] = False
+
+    # 3. RAM & Swap Memory Telemetry
+    try:
+        meminfo = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    meminfo[parts[0].strip()] = int(parts[1].split()[0])
+
+        total_ram_mb = round(meminfo.get("MemTotal", 0) / 1024, 0)
+        avail_ram_mb = round(meminfo.get("MemAvailable", 0) / 1024, 0)
+        used_ram_mb = total_ram_mb - avail_ram_mb
+        stats["ram_total_mb"] = int(total_ram_mb)
+        stats["ram_used_mb"] = int(used_ram_mb)
+        stats["ram_free_mb"] = int(avail_ram_mb)
+        stats["ram_pct"] = round((used_ram_mb / total_ram_mb) * 100, 1) if total_ram_mb > 0 else 0
+
+        total_swap_mb = round(meminfo.get("SwapTotal", 0) / 1024, 0)
+        free_swap_mb = round(meminfo.get("SwapFree", 0) / 1024, 0)
+        used_swap_mb = total_swap_mb - free_swap_mb
+        stats["swap_total_mb"] = int(total_swap_mb)
+        stats["swap_used_mb"] = int(used_swap_mb)
+        stats["swap_free_mb"] = int(free_swap_mb)
+        stats["swap_pct"] = round((used_swap_mb / total_swap_mb) * 100, 1) if total_swap_mb > 0 else 0
+    except Exception:
+        stats["ram_total_mb"] = 0
+        stats["ram_used_mb"] = 0
+        stats["ram_free_mb"] = 0
+        stats["ram_pct"] = 0
+        stats["swap_total_mb"] = 0
+        stats["swap_used_mb"] = 0
+        stats["swap_free_mb"] = 0
+        stats["swap_pct"] = 0
+
+    # 4. SoC Temperature
+    try:
+        temp_file = "/sys/class/thermal/thermal_zone0/temp"
+        if os.path.exists(temp_file):
+            with open(temp_file, "r") as f:
+                stats["cpu_temp"] = f"{round(int(f.read().strip()) / 1000.0, 1)} °C"
+        else:
+            stats["cpu_temp"] = "N/A"
+    except Exception:
+        stats["cpu_temp"] = "N/A"
+
+    # 5. System Load Average & Uptime
+    try:
+        l1, l5, l15 = os.getloadavg()
+        stats["load_avg"] = f"{l1:.2f}, {l5:.2f}, {l15:.2f}"
+    except Exception:
+        stats["load_avg"] = "N/A"
+
+    try:
+        with open("/proc/uptime", "r") as f:
+            secs = float(f.read().split()[0])
+            d = int(secs // 86400)
+            h = int((secs % 86400) // 3600)
+            m = int((secs % 3600) // 60)
+            stats["uptime"] = f"{d}d {h}h {m}m"
+    except Exception:
+        stats["uptime"] = "N/A"
+
+    return stats
+
+
 def execute_action(action):
     allowed = {
         "start": ["sudo", "systemctl", "start", SERVICE_NAME],
@@ -187,14 +295,6 @@ def safe_extract_targz(tar_bytes, dest_dir):
         tf.extractall(dest_dir)
 
 
-def get_active_worlds_dir():
-    """Resolve the real filesystem path for the worlds directory."""
-    worlds_path = os.path.join(BASE_DIR, "worlds")
-    if os.path.islink(worlds_path):
-        return os.path.realpath(worlds_path)
-    return worlds_path
-
-
 def import_world_archive(filename, file_bytes):
     """Process uploaded .mcworld, .zip, or .tar.gz archive and set as active world."""
     execute_action("backup")
@@ -211,14 +311,11 @@ def import_world_archive(filename, file_bytes):
         else:
             raise ValueError("Unsupported file format. Use .mcworld, .zip, or .tar.gz")
 
-        # Determine world structure
-        # Check if level.dat exists in the root or a subdirectory
         world_name = "ImportedWorld"
         source_world_dir = None
 
         if os.path.exists(os.path.join(temp_extract, "level.dat")):
             source_world_dir = temp_extract
-            # Try reading levelname.txt
             lname_file = os.path.join(temp_extract, "levelname.txt")
             if os.path.exists(lname_file):
                 with open(lname_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -227,7 +324,6 @@ def import_world_archive(filename, file_bytes):
                 base_clean = re.sub(r'[^a-zA-Z0-9_-]', '_', os.path.splitext(filename)[0])
                 world_name = base_clean or "ImportedWorld"
         else:
-            # Look for subdirectories containing level.dat
             for entry in os.listdir(temp_extract):
                 sub = os.path.join(temp_extract, entry)
                 if os.path.isdir(sub) and os.path.exists(os.path.join(sub, "level.dat")):
@@ -244,15 +340,22 @@ def import_world_archive(filename, file_bytes):
 
         shutil.copytree(source_world_dir, target_dir)
 
-        # Update server.properties level-name
         props = read_properties()
         props["level-name"] = world_name
         save_properties(props)
 
-        # Fix ownership
         subprocess.run(["sudo", "chown", "-R", f"{SERVER_USER}:{SERVER_GROUP}", BASE_DIR], timeout=30)
         subprocess.run(["sudo", "chown", "-R", f"{SERVER_USER}:{SERVER_GROUP}", worlds_root], timeout=30)
         execute_action("start")
+
+
+def get_progress_bar(pct):
+    color = "#28a745" if pct < 70 else ("#ffc107" if pct < 85 else "#dc3545")
+    return f"""
+    <div style="background:#e9ecef; border-radius:4px; height:12px; width:100%; overflow:hidden; margin-top:4px;">
+      <div style="background:{color}; width:{pct}%; height:100%;"></div>
+    </div>
+    """
 
 
 class WebUIHandler(http.server.BaseHTTPRequestHandler):
@@ -298,6 +401,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         props = read_properties()
         allowlist = read_allowlist()
         backups = list_backups()
+        stats = get_device_stats()
         current_level_name = props.get("level-name", "Bedrock level")
 
         status_color = "#28a745" if "ACTIVE" in status else "#dc3545"
@@ -327,11 +431,16 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
   label {{ display: block; font-weight: bold; margin-bottom: 5px; font-size: 13px; text-transform: uppercase; color: #555; }}
   input[type="text"], input[type="number"], input[type="file"], select {{ width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; font-size: 14px; }}
   .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }}
-  @media (max-width: 600px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+  .grid-3 {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; }}
+  @media (max-width: 650px) {{ .grid, .grid-3 {{ grid-template-columns: 1fr; }} }}
   table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
   th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #eee; }}
   th {{ background: #f8f9fa; font-size: 13px; text-transform: uppercase; }}
   .action-group {{ display: flex; gap: 5px; }}
+  .stat-box {{ background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 12px; }}
+  .stat-label {{ font-size: 12px; text-transform: uppercase; color: #6c757d; font-weight: bold; }}
+  .stat-val {{ font-size: 18px; font-weight: bold; color: #212529; margin-top: 4px; }}
+  .stat-sub {{ font-size: 12px; color: #495057; margin-top: 2px; }}
 </style>
 </head>
 <body>
@@ -356,6 +465,55 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
       <input type="hidden" name="action" value="backup">
       <button class="btn btn-backup" type="submit">Create New Backup</button>
     </form>
+  </div>
+
+  <div class="card">
+    <h2>Device & Hardware Telemetry</h2>
+    
+    <div class="grid-3" style="margin-bottom: 15px;">
+      <div class="stat-box">
+        <div class="stat-label">System Uptime</div>
+        <div class="stat-val">{stats['uptime']}</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">SoC Temperature</div>
+        <div class="stat-val">{stats['cpu_temp']}</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">CPU Load (1m, 5m, 15m)</div>
+        <div class="stat-val" style="font-size:15px;">{stats['load_avg']}</div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="stat-box">
+        <div class="stat-label">Primary Disk Storage (/)</div>
+        <div class="stat-val">{stats['root_used_gb']} / {stats['root_total_gb']} GiB ({stats['root_pct']}%)</div>
+        <div class="stat-sub">Free: {stats['root_free_gb']} GiB</div>
+        {get_progress_bar(stats['root_pct'])}
+      </div>
+
+      <div class="stat-box">
+        <div class="stat-label">World Storage Drive {'(External USB)' if stats['is_external_worlds'] else '(Internal)'}</div>
+        <div class="stat-val">{stats['worlds_used_gb']} / {stats['worlds_total_gb']} GiB ({stats['worlds_pct']}%)</div>
+        <div class="stat-sub">Path: <code>{stats['worlds_path']}</code></div>
+        {get_progress_bar(stats['worlds_pct'])}
+      </div>
+
+      <div class="stat-box">
+        <div class="stat-label">RAM Memory Usage</div>
+        <div class="stat-val">{stats['ram_used_mb']} / {stats['ram_total_mb']} MiB ({stats['ram_pct']}%)</div>
+        <div class="stat-sub">Available: {stats['ram_free_mb']} MiB</div>
+        {get_progress_bar(stats['ram_pct'])}
+      </div>
+
+      <div class="stat-box">
+        <div class="stat-label">Swap Memory Allocation</div>
+        <div class="stat-val">{stats['swap_used_mb']} / {stats['swap_total_mb']} MiB ({stats['swap_pct']}%)</div>
+        <div class="stat-sub">Free: {stats['swap_free_mb']} MiB</div>
+        {get_progress_bar(stats['swap_pct'])}
+      </div>
+    </div>
   </div>
 
   <div class="card">
@@ -498,7 +656,6 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         target_world_path = os.path.join(worlds_root, level_name)
 
         if not os.path.exists(target_world_path):
-            # Fallback to first directory in worlds if level-name does not match
             subdirs = [d for d in os.listdir(worlds_root) if os.path.isdir(os.path.join(worlds_root, d))] if os.path.exists(worlds_root) else []
             if subdirs:
                 target_world_path = os.path.join(worlds_root, subdirs[0])
