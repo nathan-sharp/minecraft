@@ -27,6 +27,7 @@ BASE_DIR = "/opt/minecraft/bedrock"
 BACKUP_DIR = "/opt/minecraft/backups"
 PROPERTIES_FILE = os.path.join(BASE_DIR, "server.properties")
 ALLOWLIST_FILE = os.path.join(BASE_DIR, "allowlist.json")
+BACKUP_CONFIG_FILE = "/opt/minecraft/backup_config.json"
 AUTH_FILE = "/opt/minecraft/webui/auth.json"
 SERVICE_NAME = "minecraft-bedrock.service"
 SERVER_USER = "mcserver"
@@ -52,11 +53,19 @@ VALID_PROPERTIES = {
     "texturepack-required": ["true", "false"],
 }
 
+DEFAULT_BACKUP_CONFIG = {
+    "auto_backup_enabled": True,
+    "interval_hours": 6,
+    "retention_days": 7,
+    "max_backups": 20,
+    "last_backup_timestamp": 0,
+}
+
 
 def get_auth_credentials():
     if os.path.exists(AUTH_FILE):
         try:
-            with open(AUTH_FILE, "r") as f:
+            with open(AUTH_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
@@ -133,6 +142,57 @@ def save_allowlist(entries):
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(entries, f, indent=2)
     os.replace(tmp_file, ALLOWLIST_FILE)
+
+
+def read_backup_config():
+    if os.path.exists(BACKUP_CONFIG_FILE):
+        try:
+            with open(BACKUP_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                res = DEFAULT_BACKUP_CONFIG.copy()
+                res.update(data)
+                return res
+        except Exception:
+            pass
+    return DEFAULT_BACKUP_CONFIG.copy()
+
+
+def save_backup_config(config):
+    os.makedirs(os.path.dirname(BACKUP_CONFIG_FILE), exist_ok=True)
+    tmp_file = BACKUP_CONFIG_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    os.replace(tmp_file, BACKUP_CONFIG_FILE)
+
+
+def prune_backups(retention_days=7, max_backups=20):
+    if not os.path.exists(BACKUP_DIR):
+        return
+    now = time.time()
+    cutoff_sec = retention_days * 86400
+    valid_pattern = re.compile(r"^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$")
+
+    archives = []
+    for fname in os.listdir(BACKUP_DIR):
+        if valid_pattern.match(fname):
+            fpath = os.path.join(BACKUP_DIR, fname)
+            if os.path.isfile(fpath):
+                try:
+                    mtime = os.path.getmtime(fpath)
+                    if (now - mtime) > cutoff_sec:
+                        os.remove(fpath)
+                    else:
+                        archives.append((fpath, mtime))
+                except Exception:
+                    pass
+
+    archives.sort(key=lambda x: x[1], reverse=True)
+    if len(archives) > max_backups:
+        for fpath, _ in archives[max_backups:]:
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
 
 
 def list_backups():
@@ -402,9 +462,35 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         allowlist = read_allowlist()
         backups = list_backups()
         stats = get_device_stats()
+        backup_cfg = read_backup_config()
         current_level_name = props.get("level-name", "Bedrock level")
 
         status_color = "#28a745" if "ACTIVE" in status else "#dc3545"
+
+        auto_bk_enabled = backup_cfg.get("auto_backup_enabled", True)
+        interval_hrs = backup_cfg.get("interval_hours", 6)
+        retention_days = backup_cfg.get("retention_days", 7)
+        max_backups = backup_cfg.get("max_backups", 20)
+
+        interval_options = [
+            (1, "Every 1 Hour"),
+            (3, "Every 3 Hours"),
+            (6, "Every 6 Hours (Recommended)"),
+            (12, "Every 12 Hours"),
+            (24, "Daily (Every 24 Hours)"),
+            (168, "Weekly (Every 7 Days)"),
+        ]
+
+        interval_select_html = "".join(
+            f'<option value="{val}" {"selected" if val == interval_hrs else ""}>{label}</option>'
+            for val, label in interval_options
+        )
+
+        schedule_badge = (
+            f'<span style="color:#28a745; font-weight:bold;">ENABLED</span> (Every {interval_hrs}h)'
+            if auto_bk_enabled
+            else '<span style="color:#dc3545; font-weight:bold;">DISABLED</span>'
+        )
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -425,14 +511,16 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
   .btn-backup {{ background: #17a2b8; }}
   .btn-primary {{ background: #007bff; }}
   .btn-success {{ background: #28a745; }}
-  .btn-danger {{ background: #dc3545; padding: 4px 8px; font-size: 12px; }}
+  .btn-danger {{ background: #dc3545; }}
+  .btn-warning {{ background: #ffc107; color: #000; }}
   .btn-sm {{ padding: 4px 8px; font-size: 12px; }}
   .form-group {{ margin-bottom: 15px; }}
   label {{ display: block; font-weight: bold; margin-bottom: 5px; font-size: 13px; text-transform: uppercase; color: #555; }}
   input[type="text"], input[type="number"], input[type="file"], select {{ width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; font-size: 14px; }}
   .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }}
   .grid-3 {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; }}
-  @media (max-width: 650px) {{ .grid, .grid-3 {{ grid-template-columns: 1fr; }} }}
+  .grid-4 {{ display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 15px; }}
+  @media (max-width: 650px) {{ .grid, .grid-3, .grid-4 {{ grid-template-columns: 1fr; }} }}
   table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
   th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #eee; }}
   th {{ background: #f8f9fa; font-size: 13px; text-transform: uppercase; }}
@@ -441,7 +529,24 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
   .stat-label {{ font-size: 12px; text-transform: uppercase; color: #6c757d; font-weight: bold; }}
   .stat-val {{ font-size: 18px; font-weight: bold; color: #212529; margin-top: 4px; }}
   .stat-sub {{ font-size: 12px; color: #495057; margin-top: 2px; }}
+  .toolbar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 15px; }}
 </style>
+<script>
+  function toggleSelectAll(master) {{
+    var chks = document.querySelectorAll('.backup-chk');
+    for (var i = 0; i < chks.length; i++) {{
+      chks[i].checked = master.checked;
+    }}
+  }}
+  function confirmBatchDelete() {{
+    var chks = document.querySelectorAll('.backup-chk:checked');
+    if (chks.length === 0) {{
+      alert('Please select at least one backup archive to delete.');
+      return false;
+    }}
+    return confirm('Permanently delete ' + chks.length + ' selected backup archive(s)?');
+  }}
+</script>
 </head>
 <body>
 <div class="container">
@@ -463,7 +568,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     </form>
     <form method="POST" action="/action" style="display:inline;">
       <input type="hidden" name="action" value="backup">
-      <button class="btn btn-backup" type="submit">Create New Backup</button>
+      <button class="btn btn-backup" type="submit">Create New Backup Now</button>
     </form>
   </div>
 
@@ -534,50 +639,116 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
       </div>
       <small style="display:block; color:#666; margin-top:6px;">An automatic safety backup is created before replacing the current world.</small>
     </form>
+  </div>
+
+  <div class="card">
+    <h2>Automated Backup Schedule & Retention Policy</h2>
+    <form method="POST" action="/backup/settings">
+      <div class="grid">
+        <div class="form-group">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; text-transform:none; font-size:14px; margin-top:25px;">
+            <input type="checkbox" name="auto_backup_enabled" value="true" {"checked" if auto_bk_enabled else ""} style="width:20px; height:20px;">
+            <strong>Enable Automated Scheduled Backups</strong>
+          </label>
+        </div>
+        <div class="form-group">
+          <label for="interval_hours">Backup Interval</label>
+          <select id="interval_hours" name="interval_hours">
+            {interval_select_html}
+          </select>
+        </div>
+      </div>
+      
+      <div class="grid">
+        <div class="form-group">
+          <label for="retention_days">Retention Threshold (Days)</label>
+          <input type="number" id="retention_days" name="retention_days" min="1" max="365" value="{retention_days}">
+          <small style="color:#666;">Delete backup archives older than this threshold.</small>
+        </div>
+        <div class="form-group">
+          <label for="max_backups">Maximum Archives to Retain</label>
+          <input type="number" id="max_backups" name="max_backups" min="1" max="100" value="{max_backups}">
+          <small style="color:#666;">Retain at most this number of recent backup archives.</small>
+        </div>
+      </div>
+
+      <div style="margin-top: 10px; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+        <button class="btn btn-primary" type="submit">Save Backup Configuration</button>
+      </div>
+    </form>
 
     <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
 
-    <h3>Available Server Backups ({len(backups)})</h3>
-    <table>
-      <thead>
-        <tr>
-          <th>Backup Archive</th>
-          <th>Size</th>
-          <th>Timestamp</th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody>
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+      <div>
+        <strong>Manual Retention Enforcement:</strong>
+        <span style="color:#666; font-size:13px; margin-left:6px;">Prunes archives exceeding {retention_days} days or {max_backups} total files.</span>
+      </div>
+      <form method="POST" action="/backup/prune" style="margin:0;" onsubmit="return confirm('Execute retention prune now according to policy?');">
+        <button class="btn btn-warning btn-sm" type="submit">Prune Expired Backups Now</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Available Server Backups ({len(backups)})</h2>
+    <p style="font-size:14px; color:#555; margin-bottom:15px;">
+      Auto-Schedule: {schedule_badge} &nbsp;|&nbsp; Retention: <strong>{retention_days} days</strong> / Max <strong>{max_backups} archives</strong>
+    </p>
+
+    <form method="POST" action="/backup/batch_delete" id="batchDeleteForm" onsubmit="return confirmBatchDelete();">
+      <div class="toolbar">
+        <button class="btn btn-danger btn-sm" type="submit">Delete Selected Backups</button>
+        <button class="btn btn-danger btn-sm" type="button" onclick="if(confirm('Are you ABSOLUTELY sure you want to PERMANENTLY DELETE ALL BACKUPS?')) {{ document.getElementById('deleteAllForm').submit(); }}" style="background:#b02a37;">Delete All Backups</button>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th style="width:30px;"><input type="checkbox" id="selectAll" onclick="toggleSelectAll(this)" title="Select All"></th>
+            <th>Backup Archive</th>
+            <th>Size</th>
+            <th>Timestamp</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
 """
         if not backups:
-            html += '<tr><td colspan="4" style="text-align:center;color:#888;">No backups created yet. Click "Create New Backup" above.</td></tr>'
+            html += '<tr><td colspan="5" style="text-align:center;color:#888;">No backups created yet. Click "Create New Backup Now" above.</td></tr>'
         else:
             for b in backups:
                 fname = b["filename"]
                 fsize = b["size_mb"]
                 ftime = b["modified"]
                 html += f"""<tr>
+                  <td><input type="checkbox" name="files" value="{fname}" class="backup-chk"></td>
                   <td><code>{fname}</code></td>
                   <td>{fsize} MiB</td>
                   <td>{ftime}</td>
                   <td>
                     <div class="action-group">
                       <a href="/backup/download?file={urllib.parse.quote(fname)}" class="btn btn-primary btn-sm">Download</a>
-                      <form method="POST" action="/backup/restore" style="margin:0;" onsubmit="return confirm('Restore backup {fname}? Current world will be backed up and replaced.');">
-                        <input type="hidden" name="filename" value="{fname}">
-                        <button class="btn btn-restart btn-sm" type="submit">Restore</button>
-                      </form>
-                      <form method="POST" action="/backup/delete" style="margin:0;" onsubmit="return confirm('Delete backup {fname}?');">
-                        <input type="hidden" name="filename" value="{fname}">
-                        <button class="btn btn-danger btn-sm" type="submit">Delete</button>
-                      </form>
+                      <button class="btn btn-restart btn-sm" type="button" onclick="if(confirm('Restore backup {fname}? Current world will be backed up and replaced.')) {{ document.getElementById('restore_file').value='{fname}'; document.getElementById('singleRestoreForm').submit(); }}">Restore</button>
+                      <button class="btn btn-danger btn-sm" type="button" onclick="if(confirm('Delete backup {fname}?')) {{ document.getElementById('delete_file').value='{fname}'; document.getElementById('singleDeleteForm').submit(); }}">Delete</button>
                     </div>
                   </td>
                 </tr>"""
 
         html += """
-      </tbody>
-    </table>
+        </tbody>
+      </table>
+    </form>
+
+    <!-- Hidden standalone action forms -->
+    <form method="POST" action="/backup/restore" id="singleRestoreForm" style="display:none;">
+      <input type="hidden" name="filename" id="restore_file" value="">
+    </form>
+    <form method="POST" action="/backup/delete" id="singleDeleteForm" style="display:none;">
+      <input type="hidden" name="filename" id="delete_file" value="">
+    </form>
+    <form method="POST" action="/backup/delete_all" id="deleteAllForm" style="display:none;">
+    </form>
   </div>
 
   <div class="card">
@@ -605,7 +776,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                   <td>
                     <form method="POST" action="/allowlist/remove" style="margin:0;">
                       <input type="hidden" name="gamertag" value="{name}">
-                      <button class="btn btn-danger" type="submit">Remove</button>
+                      <button class="btn btn-danger btn-sm" type="submit">Remove</button>
                     </form>
                   </td>
                 </tr>"""
@@ -772,6 +943,41 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                         new_props[key] = re.sub(r'[\r\n]', '', val)
             save_properties(new_props)
             execute_action("restart")
+        elif path == "/backup/settings":
+            auto_on = params.get("auto_backup_enabled", ["false"])[0].lower() in ["true", "on", "1"]
+            raw_interval = params.get("interval_hours", ["6"])[0]
+            raw_retention = params.get("retention_days", ["7"])[0]
+            raw_max = params.get("max_backups", ["20"])[0]
+
+            interval_val = int(raw_interval) if raw_interval.isdigit() and int(raw_interval) in [1, 3, 6, 12, 24, 168] else 6
+            retention_val = max(1, min(365, int(raw_retention))) if raw_retention.isdigit() else 7
+            max_val = max(1, min(100, int(raw_max))) if raw_max.isdigit() else 20
+
+            cfg = read_backup_config()
+            cfg["auto_backup_enabled"] = auto_on
+            cfg["interval_hours"] = interval_val
+            cfg["retention_days"] = retention_val
+            cfg["max_backups"] = max_val
+            save_backup_config(cfg)
+        elif path == "/backup/prune":
+            cfg = read_backup_config()
+            prune_backups(cfg.get("retention_days", 7), cfg.get("max_backups", 20))
+        elif path == "/backup/batch_delete":
+            file_list = params.get("files", [])
+            valid_pattern = re.compile(r"^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$")
+            for fname in file_list:
+                if valid_pattern.match(fname):
+                    fpath = os.path.join(BACKUP_DIR, fname)
+                    if os.path.exists(fpath):
+                        os.remove(fpath)
+        elif path == "/backup/delete_all":
+            if os.path.exists(BACKUP_DIR):
+                valid_pattern = re.compile(r"^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$")
+                for fname in os.listdir(BACKUP_DIR):
+                    if valid_pattern.match(fname):
+                        fpath = os.path.join(BACKUP_DIR, fname)
+                        if os.path.isfile(fpath):
+                            os.remove(fpath)
         elif path == "/backup/restore":
             fname = params.get("filename", [""])[0].strip()
             if re.match(r'^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$', fname):

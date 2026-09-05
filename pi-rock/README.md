@@ -262,38 +262,48 @@ Use a specialized Minecraft Bedrock protocol scanner that transmits genuine RakN
 
 ### 7.2 Backup and Recovery Procedures
 
-The installer provisions an automated backup utility at `/usr/local/bin/mc-backup`.
+The installer provisions an automated backup utility at `/usr/local/bin/mc-backup` and configures an hourly cron evaluation gate at `/etc/cron.d/minecraft-backup`.
 
-1. **Trigger Manual Backup**:
-   ```bash
-   sudo mc-backup
-   ```
-   *Backups are saved to `/opt/minecraft/backups/bedrock_backup_<TIMESTAMP>.tar.gz`.*
+#### 1. Backup Configuration and Schedule
+Backup parameters reside in `/opt/minecraft/backup_config.json`:
+- `auto_backup_enabled`: Enable or disable automated scheduled execution (`true`/`false`).
+- `interval_hours`: Interval between automated backups in hours (`1`, `3`, `6`, `12`, `24`, `168`).
+- `retention_days`: Maximum age in days before a backup archive is pruned (default: `7`).
+- `max_backups`: Maximum total backup archives to retain on disk (default: `20`).
 
-2. **Automate Scheduled Backups via Cron**:
-   Open root cron editor:
-   ```bash
-   sudo crontab -e
-   ```
-   Add a schedule entry to run backups daily at 03:00 UTC:
-   ```cron
-   0 3 * * * /usr/local/bin/mc-backup >/dev/null 2>&1
-   ```
+#### 2. Manual Backup and Prune Commands
+- **Trigger Immediate Backup**:
+  ```bash
+  sudo mc-backup
+  ```
+  *Creates `/opt/minecraft/backups/bedrock_backup_<TIMESTAMP>.tar.gz` and enforces retention policy.*
 
-3. **Restore from Backup**:
-   Stop the service:
+- **Execute Retention Pruning Only**:
+  ```bash
+  sudo mc-backup --prune
+  ```
+  *Removes archives exceeding configured age or count without creating a new backup.*
+
+- **Automated Cron Execution Gate**:
+  ```bash
+  sudo mc-backup --cron
+  ```
+  *Evaluates elapsed time against `interval_hours`. Executes backup only when due.*
+
+#### 3. Restore from Backup
+1. Stop the Minecraft service:
    ```bash
    sudo systemctl stop minecraft-bedrock.service
    ```
-   Extract the archive to the server directory:
+2. Extract the backup archive to the server directory:
    ```bash
    sudo tar -xzf /opt/minecraft/backups/bedrock_backup_YYYYMMDD_HHMMSS.tar.gz -C /opt/minecraft/bedrock
    ```
-   Correct file permissions:
+3. Set file ownership to `mcserver`:
    ```bash
    sudo chown -R mcserver:mcserver /opt/minecraft
    ```
-   Start the service:
+4. Start the Minecraft service:
    ```bash
    sudo systemctl start minecraft-bedrock.service
    ```
@@ -406,11 +416,16 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
   - Linux swap memory metrics (total, used, free, and percentage utilized).
   - System on Chip (SoC) temperature in degrees Celsius (°C).
   - Linux load averages (1-minute, 5-minute, and 15-minute intervals) and total system uptime.
-- **World File Management**:
+- **Automated Backup & Retention Controls**:
+  - Configure automated backup schedules (Every 1h, 3h, 6h, 12h, 24h, 168h).
+  - Define retention thresholds in days (e.g. 7 days) and maximum archive counts (e.g. 20 archives).
+  - Trigger on-demand retention pruning to remove expired or excess archives.
+- **World & Backup Archive Management**:
   - Download the active live world as an `.mcworld` package directly to your computer.
-  - Upload existing worlds (`.mcworld`, `.zip`, `.tar.gz`) to replace the active server world with automatic pre-import safety backups.
-  - View all server backups with timestamps and file sizes.
-  - One-click backup file download, one-click restoration, and deletion.
+  - Upload existing worlds (`.mcworld`, `.zip`, `.tar.gz`) with automatic pre-import safety backups.
+  - Multi-select batch deletion of backup archives with safety confirmation.
+  - Individual archive downloads, one-click restoration, and deletion.
+  - Dedicated "Delete All Backups" action with confirmation dialog.
 - **Configuration Editor**: Modify `server.properties` parameters with visual form controls.
 - **Allowlist Controls**: Add or remove authorized Xbox Gamertags.
 - **Security**: Protected with HTTP Basic Authentication and positive input validation.
