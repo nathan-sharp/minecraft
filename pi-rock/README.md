@@ -350,13 +350,37 @@ The installer provisions a dedicated utility at `/usr/local/bin/mc-set-storage` 
    sudo mc-set-storage
    ```
 
-### 7.5 Allowlist and Access Control Management
+### 7.5 Player Access and Permission Management
 
-The server includes an allowlist to restrict access to approved Xbox Gamertags.
+The server manages access via `allowlist.json` and granular player permission roles via `permissions.json`.
 
-#### Method 1: Using the Automated Helper Tool (`mc-allowlist`)
+#### Permission Role Definitions:
+- **`visitor`**: Exploration mode. Players cannot mine, build, craft, attack, or interact with containers.
+- **`member`**: Standard survival player. Can build, mine, craft, attack, and open containers.
+- **`operator`**: Full administrator. Can execute in-game console commands (e.g. `/op`, `/teleport`, `/gamemode`).
+- **`default`**: Inherits the server-wide `default-player-permission-level` specified in `server.properties`.
 
-The installer provisions `/usr/local/bin/mc-allowlist` to manage player access:
+#### Method 1: Player Permission Management via CLI (`mc-permission`)
+
+The installer provisions `/usr/local/bin/mc-permission`:
+
+1. View all configured players, XUIDs, and permission roles:
+   ```bash
+   sudo mc-permission list
+   ```
+2. Assign a permission role to an Xbox User ID (XUID) or Gamertag:
+   ```bash
+   sudo mc-permission set "PlayerGamertag" operator
+   sudo mc-permission set 2535412345678901 visitor
+   ```
+3. Remove a permission override (reverts player to server default):
+   ```bash
+   sudo mc-permission remove "PlayerGamertag"
+   ```
+
+#### Method 2: Allowlist Enforcement (`mc-allowlist`)
+
+The installer provisions `/usr/local/bin/mc-allowlist` to control server access:
 
 1. Enable allowlist enforcement:
    ```bash
@@ -366,7 +390,7 @@ The installer provisions `/usr/local/bin/mc-allowlist` to manage player access:
    ```bash
    sudo mc-allowlist add "YourGamertag"
    ```
-3. View all currently allowlisted players:
+3. View all allowlisted players:
    ```bash
    sudo mc-allowlist list
    ```
@@ -374,33 +398,9 @@ The installer provisions `/usr/local/bin/mc-allowlist` to manage player access:
    ```bash
    sudo mc-allowlist remove "YourGamertag"
    ```
-5. Disable allowlist enforcement (allows all players):
+5. Disable allowlist enforcement:
    ```bash
    sudo mc-allowlist off
-   ```
-
-#### Method 2: Manual JSON Configuration
-
-1. Open `/opt/minecraft/bedrock/allowlist.json` in a text editor:
-   ```bash
-   sudo nano /opt/minecraft/bedrock/allowlist.json
-   ```
-2. Add player objects with exact Xbox Gamertags:
-   ```json
-   [
-     {
-       "name": "PlayerOneGamertag",
-       "ignoresPlayerLimit": false
-     },
-     {
-       "name": "PlayerTwoGamertag",
-       "ignoresPlayerLimit": false
-     }
-   ]
-   ```
-3. Save the file and restart the server daemon:
-   ```bash
-   sudo systemctl restart minecraft-bedrock.service
    ```
 
 ### 7.6 Web Administration Interface
@@ -416,6 +416,11 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
   - Linux swap memory metrics (total, used, free, and percentage utilized).
   - System on Chip (SoC) temperature in degrees Celsius (°C).
   - Linux load averages (1-minute, 5-minute, and 15-minute intervals) and total system uptime.
+- **Player Access & Permission Role Management**:
+  - Unified table listing Gamertags, XUIDs, permission roles, and allowlist states.
+  - Inline role dropdowns (`Default`, `Visitor`, `Member`, `Operator`) with instant update and automatic service restart.
+  - Add players with Gamertag, optional 16-digit XUID, and initial role.
+  - Direct XUID permission overrides.
 - **Automated Backup & Retention Controls**:
   - Configure automated backup schedules (Every 1h, 3h, 6h, 12h, 24h, 168h).
   - Define retention thresholds in days (e.g. 7 days) and maximum archive counts (e.g. 20 archives).
@@ -427,7 +432,6 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
   - Individual archive downloads, one-click restoration, and deletion.
   - Dedicated "Delete All Backups" action with confirmation dialog.
 - **Configuration Editor**: Modify `server.properties` parameters with visual form controls.
-- **Allowlist Controls**: Add or remove authorized Xbox Gamertags.
 - **Security**: Protected with HTTP Basic Authentication and positive input validation.
 
 #### Procedure: Accessing the Web UI

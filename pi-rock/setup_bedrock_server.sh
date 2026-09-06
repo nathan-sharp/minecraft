@@ -804,7 +804,236 @@ esac
 EOF
     chmod 755 /usr/local/bin/mc-allowlist
 
-    log_info "Administrative tools installed: /usr/local/bin/mc-backup, /usr/local/bin/mc-update, /usr/local/bin/mc-set-storage, /usr/local/bin/mc-allowlist"
+    # 5. mc-permission tool (manages player roles: visitor, member, operator, default)
+    cat > /usr/local/bin/mc-permission << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "[ERROR] This tool must execute with root privileges: sudo mc-permission <COMMAND> [ARGS]" >&2
+    exit 1
+fi
+
+INSTALL_PATH="/opt/minecraft/bedrock"
+PERMISSIONS_FILE="${INSTALL_PATH}/permissions.json"
+ALLOWLIST_FILE="${INSTALL_PATH}/allowlist.json"
+SERVER_PROPS="${INSTALL_PATH}/server.properties"
+
+show_usage() {
+    echo "Usage: sudo mc-permission <COMMAND> [ARGS]"
+    echo ""
+    echo "Commands:"
+    echo "  list                                  List all players, XUIDs, and permission roles"
+    echo "  set <XUID|GAMERTAG> <ROLE>            Set role: visitor, member, operator, default"
+    echo "  remove <XUID|GAMERTAG>                Revert player role to server-wide default"
+    echo ""
+    echo "Permission Roles:"
+    echo "  visitor   - Exploration mode (cannot mine, build, craft, or open containers)"
+    echo "  member    - Standard survival gameplay (build, craft, mine, attack)"
+    echo "  operator  - Administrator privileges with in-game console command access"
+    echo "  default   - Inherits server default from server.properties"
+    exit 1
+}
+
+# Ensure permissions.json exists
+if [[ ! -f "${PERMISSIONS_FILE}" ]]; then
+    echo "[]" > "${PERMISSIONS_FILE}"
+    chown mcserver:mcserver "${PERMISSIONS_FILE}"
+    chmod 640 "${PERMISSIONS_FILE}"
+fi
+
+if [[ $# -lt 1 ]]; then
+    show_usage
+fi
+
+COMMAND="$1"
+
+case "${COMMAND}" in
+    list)
+        python3 -c "
+import json, os
+
+perms_path = '${PERMISSIONS_FILE}'
+allow_path = '${ALLOWLIST_FILE}'
+props_path = '${SERVER_PROPS}'
+
+default_role = 'member'
+if os.path.exists(props_path):
+    with open(props_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip().startswith('default-player-permission-level='):
+                default_role = line.strip().split('=', 1)[1].strip()
+
+perms = []
+if os.path.exists(perms_path):
+    try:
+        with open(perms_path, 'r', encoding='utf-8') as f:
+            perms = json.load(f)
+    except Exception:
+        perms = []
+
+allows = []
+if os.path.exists(allow_path):
+    try:
+        with open(allow_path, 'r', encoding='utf-8') as f:
+            allows = json.load(f)
+    except Exception:
+        allows = []
+
+perm_map = {str(p.get('xuid', '')).strip(): str(p.get('permission', '')).strip() for p in perms if 'xuid' in p}
+
+print(f'Server Default Role: {default_role.upper()}')
+print(f'{"#":<4} {"GAMERTAG":<22} {"XUID":<20} {"ASSIGNED ROLE":<16} {"ALLOWLIST"}')
+print('-' * 75)
+
+seen_xuids = set()
+idx = 1
+for a in allows:
+    name = a.get('name', 'Unknown')
+    xuid = str(a.get('xuid', '')).strip() if a.get('xuid') else ''
+    if xuid:
+        seen_xuids.add(xuid)
+    role = perm_map.get(xuid, f'default ({default_role})') if xuid else f'default ({default_role})'
+    xuid_str = xuid if xuid else '(pending join)'
+    print(f'{idx:<4} {name:<22} {xuid_str:<20} {role:<16} Yes')
+    idx += 1
+
+for p in perms:
+    xuid = str(p.get('xuid', '')).strip()
+    if xuid and xuid not in seen_xuids:
+        role = p.get('permission', default_role)
+        print(f'{idx:<4} {"(Direct XUID)":<22} {xuid:<20} {role:<16} No')
+        idx += 1
+
+if idx == 1:
+    print('  (No players configured)')
+"
+        ;;
+    set)
+        if [[ $# -lt 3 ]]; then
+            echo "[ERROR] Missing arguments. Usage: sudo mc-permission set <XUID|GAMERTAG> <visitor|member|operator|default>" >&2
+            exit 1
+        fi
+        TARGET="$2"
+        ROLE="$(echo "$3" | tr '[:upper:]' '[:lower:]')"
+
+        if [[ ! "${ROLE}" =~ ^(visitor|member|operator|default)$ ]]; then
+            echo "[ERROR] Invalid role '${ROLE}'. Supported: visitor, member, operator, default" >&2
+            exit 1
+        fi
+
+        python3 -c "
+import json, sys, os, re
+
+perms_path = '${PERMISSIONS_FILE}'
+allow_path = '${ALLOWLIST_FILE}'
+target = sys.argv[1].strip()
+role = sys.argv[2].strip().lower()
+
+xuid = ''
+if re.match(r'^[0-9]+$', target):
+    xuid = target
+else:
+    if os.path.exists(allow_path):
+        try:
+            with open(allow_path, 'r', encoding='utf-8') as f:
+                allows = json.load(f)
+            for a in allows:
+                if a.get('name', '').lower() == target.lower() and a.get('xuid'):
+                    xuid = str(a.get('xuid', '')).strip()
+                    break
+        except Exception:
+            pass
+
+if not xuid:
+    print(f'[ERROR] Could not resolve numeric XUID for '{target}'. Provide the 16-digit XUID or connect with player first.', file=sys.stderr)
+    sys.exit(1)
+
+perms = []
+if os.path.exists(perms_path):
+    try:
+        with open(perms_path, 'r', encoding='utf-8') as f:
+            perms = json.load(f)
+    except Exception:
+        perms = []
+
+perms = [p for p in perms if str(p.get('xuid', '')).strip() != xuid]
+if role in ['visitor', 'member', 'operator']:
+    perms.append({'permission': role, 'xuid': xuid})
+
+with open(perms_path, 'w', encoding='utf-8') as f:
+    json.dump(perms, f, indent=2)
+
+print(f'[INFO] Set permission role for XUID {xuid} to '{role}'.')
+" "${TARGET}" "${ROLE}"
+        chown mcserver:mcserver "${PERMISSIONS_FILE}"
+        chmod 640 "${PERMISSIONS_FILE}"
+        echo "[INFO] Restarting server to apply permission updates..."
+        systemctl restart minecraft-bedrock.service
+        ;;
+    remove)
+        if [[ $# -lt 2 ]]; then
+            echo "[ERROR] Missing target. Usage: sudo mc-permission remove <XUID|GAMERTAG>" >&2
+            exit 1
+        fi
+        TARGET="$2"
+        python3 -c "
+import json, sys, os, re
+
+perms_path = '${PERMISSIONS_FILE}'
+allow_path = '${ALLOWLIST_FILE}'
+target = sys.argv[1].strip()
+
+xuid = target if re.match(r'^[0-9]+$', target) else ''
+if not xuid and os.path.exists(allow_path):
+    try:
+        with open(allow_path, 'r', encoding='utf-8') as f:
+            allows = json.load(f)
+        for a in allows:
+            if a.get('name', '').lower() == target.lower() and a.get('xuid'):
+                xuid = str(a.get('xuid', '')).strip()
+                break
+    except Exception:
+        pass
+
+if not xuid:
+    print(f'[ERROR] Could not resolve numeric XUID for '{target}'.', file=sys.stderr)
+    sys.exit(1)
+
+perms = []
+if os.path.exists(perms_path):
+    try:
+        with open(perms_path, 'r', encoding='utf-8') as f:
+            perms = json.load(f)
+    except Exception:
+        perms = []
+
+new_perms = [p for p in perms if str(p.get('xuid', '')).strip() != xuid]
+with open(perms_path, 'w', encoding='utf-8') as f:
+    json.dump(new_perms, f, indent=2)
+
+print(f'[INFO] Removed custom permission override for XUID {xuid}. Player will use server default role.')
+" "${TARGET}"
+        chown mcserver:mcserver "${PERMISSIONS_FILE}"
+        chmod 640 "${PERMISSIONS_FILE}"
+        echo "[INFO] Restarting server to apply changes..."
+        systemctl restart minecraft-bedrock.service
+        ;;
+    *)
+        show_usage
+        ;;
+esac
+EOF
+    chmod 755 /usr/local/bin/mc-permission
+
+    # Ensure permissions.json is initialized
+    if [[ ! -f /opt/minecraft/bedrock/permissions.json ]]; then
+        echo "[]" > /opt/minecraft/bedrock/permissions.json
+        chown mcserver:mcserver /opt/minecraft/bedrock/permissions.json
+        chmod 640 /opt/minecraft/bedrock/permissions.json
+    fi
+
+    log_info "Administrative tools installed: /usr/local/bin/mc-backup, /usr/local/bin/mc-update, /usr/local/bin/mc-set-storage, /usr/local/bin/mc-allowlist, /usr/local/bin/mc-permission"
 }
 
 # ------------------------------------------------------------------------------
@@ -861,6 +1090,7 @@ BASE_DIR = "/opt/minecraft/bedrock"
 BACKUP_DIR = "/opt/minecraft/backups"
 PROPERTIES_FILE = os.path.join(BASE_DIR, "server.properties")
 ALLOWLIST_FILE = os.path.join(BASE_DIR, "allowlist.json")
+PERMISSIONS_FILE = os.path.join(BASE_DIR, "permissions.json")
 BACKUP_CONFIG_FILE = "/opt/minecraft/backup_config.json"
 AUTH_FILE = "/opt/minecraft/webui/auth.json"
 SERVICE_NAME = "minecraft-bedrock.service"
@@ -894,6 +1124,8 @@ DEFAULT_BACKUP_CONFIG = {
     "max_backups": 20,
     "last_backup_timestamp": 0,
 }
+
+VALID_PERMISSIONS = ["visitor", "member", "operator", "default"]
 
 
 def get_auth_credentials():
@@ -976,6 +1208,80 @@ def save_allowlist(entries):
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(entries, f, indent=2)
     os.replace(tmp_file, ALLOWLIST_FILE)
+
+
+def read_permissions():
+    if os.path.exists(PERMISSIONS_FILE):
+        try:
+            with open(PERMISSIONS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def save_permissions(entries):
+    tmp_file = PERMISSIONS_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(entries, f, indent=2)
+    os.replace(tmp_file, PERMISSIONS_FILE)
+
+
+def get_unified_players():
+    allowlist = read_allowlist()
+    permissions = read_permissions()
+    props = read_properties()
+    default_role = props.get("default-player-permission-level", "member")
+
+    perm_map = {}
+    for p in permissions:
+        if isinstance(p, dict) and "xuid" in p and "permission" in p:
+            perm_map[str(p["xuid"]).strip()] = str(p["permission"]).strip().lower()
+
+    unified = []
+    seen_xuids = set()
+
+    for entry in allowlist:
+        if isinstance(entry, dict):
+            name = entry.get("name", "Unknown")
+            xuid = str(entry.get("xuid", "")).strip() if entry.get("xuid") else ""
+            ignores = entry.get("ignoresPlayerLimit", False)
+            assigned_role = perm_map.get(xuid, "default") if xuid else "default"
+            if xuid:
+                seen_xuids.add(xuid)
+            unified.append({
+                "name": name,
+                "xuid": xuid,
+                "permission": assigned_role,
+                "is_allowlisted": True,
+                "ignoresPlayerLimit": ignores,
+            })
+
+    for p in permissions:
+        if isinstance(p, dict) and "xuid" in p:
+            pxuid = str(p.get("xuid", "")).strip()
+            if pxuid and pxuid not in seen_xuids:
+                unified.append({
+                    "name": "(Direct XUID Override)",
+                    "xuid": pxuid,
+                    "permission": str(p.get("permission", default_role)).lower(),
+                    "is_allowlisted": False,
+                    "ignoresPlayerLimit": False,
+                })
+
+    return unified, default_role
+
+
+def set_player_permission_level(xuid, role):
+    xuid_str = str(xuid).strip()
+    if not re.match(r"^[0-9]+$", xuid_str):
+        return
+    role = role.strip().lower()
+    permissions = read_permissions()
+    new_perms = [p for p in permissions if str(p.get("xuid", "")).strip() != xuid_str]
+    if role in ["visitor", "member", "operator"]:
+        new_perms.append({"permission": role, "xuid": xuid_str})
+    save_permissions(new_perms)
 
 
 def read_backup_config():
@@ -1293,10 +1599,10 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
         status = get_service_status()
         props = read_properties()
-        allowlist = read_allowlist()
         backups = list_backups()
         stats = get_device_stats()
         backup_cfg = read_backup_config()
+        unified_players, default_role = get_unified_players()
         current_level_name = props.get("level-name", "Bedrock level")
 
         status_color = "#28a745" if "ACTIVE" in status else "#dc3545"
@@ -1337,7 +1643,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
   .container {{ max-width: 960px; margin: 0 auto; }}
   .card {{ background: #fff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 20px; margin-bottom: 20px; }}
   h1, h2, h3 {{ margin-top: 0; color: #1a1a1a; }}
-  .badge {{ display: inline-block; padding: 6px 12px; font-weight: bold; border-radius: 4px; color: #fff; background: {status_color}; }}
+  .badge {{ display: inline-block; padding: 4px 8px; font-weight: bold; border-radius: 4px; color: #fff; font-size: 12px; }}
   .btn {{ display: inline-block; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; text-decoration: none; color: #fff; font-size: 14px; margin-right: 8px; margin-bottom: 8px; }}
   .btn-start {{ background: #28a745; }}
   .btn-stop {{ background: #dc3545; }}
@@ -1358,7 +1664,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
   table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
   th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #eee; }}
   th {{ background: #f8f9fa; font-size: 13px; text-transform: uppercase; }}
-  .action-group {{ display: flex; gap: 5px; }}
+  .action-group {{ display: flex; gap: 5px; align-items: center; }}
   .stat-box {{ background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 12px; }}
   .stat-label {{ font-size: 12px; text-transform: uppercase; color: #6c757d; font-weight: bold; }}
   .stat-val {{ font-size: 18px; font-weight: bold; color: #212529; margin-top: 4px; }}
@@ -1380,6 +1686,20 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     }}
     return confirm('Permanently delete ' + chks.length + ' selected backup archive(s)?');
   }}
+  function promptAssignXuid(gamertag) {{
+    var xuid = prompt('Enter 16-digit Xbox User ID (XUID) for player \"' + gamertag + '\":');
+    if (xuid && /^[0-9]+$/.test(xuid.trim())) {{
+      var role = prompt('Enter permission role (visitor, member, operator, default):', 'member');
+      if (role) {{
+        document.getElementById('assign_gamertag').value = gamertag;
+        document.getElementById('assign_xuid').value = xuid.trim();
+        document.getElementById('assign_permission').value = role.trim().toLowerCase();
+        document.getElementById('assignXuidForm').submit();
+      }}
+    }} else if (xuid) {{
+      alert('Invalid XUID format. Must contain digits only.');
+    }}
+  }}
 </script>
 </head>
 <body>
@@ -1387,7 +1707,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
   <h1>Minecraft Bedrock Server Manager</h1>
   
   <div class="card">
-    <h2>Server Status: <span class="badge">{status}</span></h2>
+    <h2>Server Status: <span class="badge" style="background:{status_color}; font-size:14px; padding:6px 12px;">{status}</span></h2>
     <form method="POST" action="/action" style="display:inline;">
       <input type="hidden" name="action" value="start">
       <button class="btn btn-start" type="submit">Start Server</button>
@@ -1569,12 +1889,12 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                   </td>
                 </tr>"""
 
-        html += """
+        html += f"""
         </tbody>
       </table>
     </form>
 
-    <!-- Hidden standalone action forms -->
+    <!-- Hidden standalone backup action forms -->
     <form method="POST" action="/backup/restore" id="singleRestoreForm" style="display:none;">
       <input type="hidden" name="filename" id="restore_file" value="">
     </form>
@@ -1586,30 +1906,102 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
   </div>
 
   <div class="card">
-    <h2>Player Allowlist Access Control</h2>
-    <form method="POST" action="/allowlist/add" style="margin-bottom: 15px;">
-      <div style="display: flex; gap: 10px;">
-        <input type="text" name="gamertag" placeholder="Enter Xbox Gamertag" required style="flex:1;">
-        <button class="btn btn-primary" type="submit" style="margin:0;">Add Player</button>
+    <h2>Player Access Control & Permission Management</h2>
+    <p style="font-size:14px; color:#555; margin-bottom:15px;">
+      Server-wide Default Role: <strong>{default_role.upper()}</strong> (Configurable under server.properties)
+    </p>
+
+    <h3>Add Authorized Player</h3>
+    <form method="POST" action="/player/add" style="margin-bottom: 20px;">
+      <div class="grid-3" style="align-items:flex-end;">
+        <div class="form-group" style="margin-bottom:0;">
+          <label for="new_gamertag">Xbox Gamertag</label>
+          <input type="text" id="new_gamertag" name="gamertag" placeholder="e.g. PlayerOne" required>
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label for="new_xuid">XUID (Optional, 16 Digits)</label>
+          <input type="text" id="new_xuid" name="xuid" placeholder="e.g. 2535412345678901">
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label for="new_permission">Initial Permission Role</label>
+          <select id="new_permission" name="permission">
+            <option value="default">Default ({default_role})</option>
+            <option value="visitor">Visitor</option>
+            <option value="member">Member</option>
+            <option value="operator">Operator (Admin)</option>
+          </select>
+        </div>
       </div>
+      <button class="btn btn-primary" type="submit" style="margin-top: 12px;">Add Player & Save Role</button>
     </form>
+
+    <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
+
+    <h3>Authorized Players & Roles ({len(unified_players)})</h3>
     <table>
-      <thead><tr><th>#</th><th>Authorized Gamertag</th><th>Ignore Limits</th><th>Action</th></tr></thead>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Xbox Gamertag</th>
+          <th>Xbox User ID (XUID)</th>
+          <th>Current Role</th>
+          <th>Change Role</th>
+          <th>Allowlist</th>
+          <th>Action</th>
+        </tr>
+      </thead>
       <tbody>
 """
-        if not allowlist:
-            html += '<tr><td colspan="4" style="text-align:center;color:#888;">No players on allowlist</td></tr>'
+        if not unified_players:
+            html += '<tr><td colspan="7" style="text-align:center;color:#888;">No authorized players configured. Add a player above.</td></tr>'
         else:
-            for idx, entry in enumerate(allowlist, 1):
-                name = entry.get("name", "Unknown")
-                ignore = "Yes" if entry.get("ignoresPlayerLimit") else "No"
+            for idx, p in enumerate(unified_players, 1):
+                pname = p["name"]
+                pxuid = p["xuid"]
+                perm = p["permission"]
+                is_allow = "Yes" if p["is_allowlisted"] else "No (Direct XUID)"
+
+                if perm == "operator":
+                    role_badge = '<span class="badge" style="background:#dc3545;">Operator</span>'
+                elif perm == "member":
+                    role_badge = '<span class="badge" style="background:#28a745;">Member</span>'
+                elif perm == "visitor":
+                    role_badge = '<span class="badge" style="background:#17a2b8;">Visitor</span>'
+                else:
+                    role_badge = f'<span class="badge" style="background:#6c757d;">Default ({default_role})</span>'
+
+                role_change_cell = ""
+                if pxuid:
+                    role_change_cell = f"""
+                    <form method="POST" action="/player/set_permission" style="margin:0; display:flex; gap:4px; align-items:center;">
+                      <input type="hidden" name="xuid" value="{pxuid}">
+                      <input type="hidden" name="gamertag" value="{pname}">
+                      <select name="permission" style="width:auto; padding:4px 8px; font-size:12px;">
+                        <option value="default" {"selected" if perm=="default" else ""}>Default ({default_role})</option>
+                        <option value="visitor" {"selected" if perm=="visitor" else ""}>Visitor</option>
+                        <option value="member" {"selected" if perm=="member" else ""}>Member</option>
+                        <option value="operator" {"selected" if perm=="operator" else ""}>Operator</option>
+                      </select>
+                      <button class="btn btn-primary btn-sm" type="submit" style="margin:0;">Apply</button>
+                    </form>"""
+                else:
+                    role_change_cell = f"""
+                    <button class="btn btn-sm" style="background:#6c757d; margin:0;" type="button" onclick="promptAssignXuid('{pname}')">Assign XUID</button>
+                    """
+
+                xuid_display = f"<code>{pxuid}</code>" if pxuid else '<span style="color:#888; font-size:12px;">(Pending connection)</span>'
+
                 html += f"""<tr>
                   <td>{idx}</td>
-                  <td><strong>{name}</strong></td>
-                  <td>{ignore}</td>
+                  <td><strong>{pname}</strong></td>
+                  <td>{xuid_display}</td>
+                  <td>{role_badge}</td>
+                  <td>{role_change_cell}</td>
+                  <td>{is_allow}</td>
                   <td>
-                    <form method="POST" action="/allowlist/remove" style="margin:0;">
-                      <input type="hidden" name="gamertag" value="{name}">
+                    <form method="POST" action="/player/remove" style="margin:0;" onsubmit="return confirm('Remove player {pname} from access list?');">
+                      <input type="hidden" name="gamertag" value="{pname}">
+                      <input type="hidden" name="xuid" value="{pxuid}">
                       <button class="btn btn-danger btn-sm" type="submit">Remove</button>
                     </form>
                   </td>
@@ -1618,6 +2010,24 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         html += """
       </tbody>
     </table>
+
+    <div style="background:#f8f9fa; border:1px solid #e9ecef; border-radius:6px; padding:12px; margin-top:15px; font-size:13px; color:#555;">
+      <strong>Role Descriptions:</strong>
+      <ul style="margin:6px 0 0 18px; padding:0;">
+        <li><strong>Visitor:</strong> Read-only exploration mode. Cannot mine, build, craft, or open containers.</li>
+        <li><strong>Member:</strong> Standard survival gameplay. Can build, mine, craft, and attack.</li>
+        <li><strong>Operator:</strong> Full administrator privileges with access to in-game console commands (e.g. <code>/op</code>, <code>/teleport</code>, <code>/gamemode</code>).</li>
+        <li><strong>Default:</strong> Inherits the <code>default-player-permission-level</code> configured in <code>server.properties</code>.</li>
+      </ul>
+      <small style="display:block; margin-top:6px; color:#777;">* Note: If an XUID is omitted when adding a Gamertag, the server registers the 16-digit XUID automatically upon the player's first connection.</small>
+    </div>
+
+    <!-- Hidden form for promptAssignXuid -->
+    <form method="POST" action="/player/set_permission" id="assignXuidForm" style="display:none;">
+      <input type="hidden" name="gamertag" id="assign_gamertag" value="">
+      <input type="hidden" name="xuid" id="assign_xuid" value="">
+      <input type="hidden" name="permission" id="assign_permission" value="">
+    </form>
   </div>
 
   <div class="card">
@@ -1749,21 +2159,75 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         if path == "/action":
             action = params.get("action", [""])[0]
             execute_action(action)
-        elif path == "/allowlist/add":
+        elif path == "/player/add" or path == "/allowlist/add":
             tag = params.get("gamertag", [""])[0].strip()
+            xuid = params.get("xuid", [""])[0].strip()
+            permission = params.get("permission", ["default"])[0].strip().lower()
+
             if tag:
                 allowlist = read_allowlist()
-                if not any(e.get("name", "").lower() == tag.lower() for e in allowlist):
-                    allowlist.append({"name": tag, "ignoresPlayerLimit": False})
-                    save_allowlist(allowlist)
-                    execute_action("restart")
-        elif path == "/allowlist/remove":
-            tag = params.get("gamertag", [""])[0].strip()
-            if tag:
-                allowlist = read_allowlist()
-                allowlist = [e for e in allowlist if e.get("name", "").lower() != tag.lower()]
+                existing_entry = next((e for e in allowlist if e.get("name", "").lower() == tag.lower()), None)
+                if existing_entry:
+                    if xuid and re.match(r"^[0-9]+$", xuid):
+                        existing_entry["xuid"] = xuid
+                else:
+                    new_entry = {"name": tag, "ignoresPlayerLimit": False}
+                    if xuid and re.match(r"^[0-9]+$", xuid):
+                        new_entry["xuid"] = xuid
+                    allowlist.append(new_entry)
                 save_allowlist(allowlist)
+
+                if xuid and re.match(r"^[0-9]+$", xuid):
+                    set_player_permission_level(xuid, permission)
+
                 execute_action("restart")
+
+        elif path == "/player/set_permission":
+            xuid = params.get("xuid", [""])[0].strip()
+            gamertag = params.get("gamertag", [""])[0].strip()
+            permission = params.get("permission", ["default"])[0].strip().lower()
+
+            if not xuid and gamertag:
+                allowlist = read_allowlist()
+                for e in allowlist:
+                    if e.get("name", "").lower() == gamertag.lower() and e.get("xuid"):
+                        xuid = str(e.get("xuid", "")).strip()
+                        break
+
+            if xuid and re.match(r"^[0-9]+$", xuid):
+                set_player_permission_level(xuid, permission)
+                if gamertag:
+                    allowlist = read_allowlist()
+                    for e in allowlist:
+                        if e.get("name", "").lower() == gamertag.lower():
+                            e["xuid"] = xuid
+                            save_allowlist(allowlist)
+                            break
+                execute_action("restart")
+
+        elif path == "/player/remove" or path == "/allowlist/remove":
+            tag = params.get("gamertag", [""])[0].strip()
+            xuid = params.get("xuid", [""])[0].strip()
+
+            if tag or xuid:
+                allowlist = read_allowlist()
+                if tag:
+                    matched = [e for e in allowlist if e.get("name", "").lower() == tag.lower()]
+                    for m in matched:
+                        if not xuid and m.get("xuid"):
+                            xuid = str(m.get("xuid")).strip()
+                    allowlist = [e for e in allowlist if e.get("name", "").lower() != tag.lower()]
+                if xuid:
+                    allowlist = [e for e in allowlist if str(e.get("xuid", "")).strip() != xuid]
+                save_allowlist(allowlist)
+
+                if xuid:
+                    permissions = read_permissions()
+                    permissions = [p for p in permissions if str(p.get("xuid", "")).strip() != xuid]
+                    save_permissions(permissions)
+
+                execute_action("restart")
+
         elif path == "/settings":
             new_props = {}
             for key, spec in VALID_PROPERTIES.items():
@@ -1777,6 +2241,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                         new_props[key] = re.sub(r'[\r\n]', '', val)
             save_properties(new_props)
             execute_action("restart")
+
         elif path == "/backup/settings":
             auto_on = params.get("auto_backup_enabled", ["false"])[0].lower() in ["true", "on", "1"]
             raw_interval = params.get("interval_hours", ["6"])[0]
@@ -1793,9 +2258,11 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             cfg["retention_days"] = retention_val
             cfg["max_backups"] = max_val
             save_backup_config(cfg)
+
         elif path == "/backup/prune":
             cfg = read_backup_config()
             prune_backups(cfg.get("retention_days", 7), cfg.get("max_backups", 20))
+
         elif path == "/backup/batch_delete":
             file_list = params.get("files", [])
             valid_pattern = re.compile(r"^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$")
@@ -1804,6 +2271,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                     fpath = os.path.join(BACKUP_DIR, fname)
                     if os.path.exists(fpath):
                         os.remove(fpath)
+
         elif path == "/backup/delete_all":
             if os.path.exists(BACKUP_DIR):
                 valid_pattern = re.compile(r"^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$")
@@ -1812,6 +2280,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                         fpath = os.path.join(BACKUP_DIR, fname)
                         if os.path.isfile(fpath):
                             os.remove(fpath)
+
         elif path == "/backup/restore":
             fname = params.get("filename", [""])[0].strip()
             if re.match(r'^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$', fname):
@@ -1823,6 +2292,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                         subprocess.run(["tar", "-xzhf", fpath, "-C", BASE_DIR], timeout=60)
                     subprocess.run(["sudo", "chown", "-R", f"{SERVER_USER}:{SERVER_GROUP}", "/opt/minecraft"], timeout=30)
                     execute_action("start")
+
         elif path == "/backup/delete":
             fname = params.get("filename", [""])[0].strip()
             if re.match(r'^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$', fname):
@@ -1851,7 +2321,7 @@ PYEOF
 
     # Configure bounded sudoers permissions for mcserver
     cat > "${sudoers_file}" << 'EOF'
-mcserver ALL=(ALL) NOPASSWD: /usr/bin/systemctl start minecraft-bedrock.service, /usr/bin/systemctl stop minecraft-bedrock.service, /usr/bin/systemctl restart minecraft-bedrock.service, /usr/bin/systemctl is-active minecraft-bedrock.service, /usr/local/bin/mc-backup
+mcserver ALL=(ALL) NOPASSWD: /usr/bin/systemctl start minecraft-bedrock.service, /usr/bin/systemctl stop minecraft-bedrock.service, /usr/bin/systemctl restart minecraft-bedrock.service, /usr/bin/systemctl is-active minecraft-bedrock.service, /usr/local/bin/mc-backup, /usr/local/bin/mc-permission
 EOF
     chmod 440 "${sudoers_file}"
 
