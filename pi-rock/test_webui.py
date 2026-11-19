@@ -6,6 +6,7 @@ Follows strict Arrange-Act-Assert (AAA) structure with pure Python standard libr
 
 import base64
 import http.client
+import http.server
 import json
 import os
 import socket
@@ -170,6 +171,83 @@ class TestLocalProcNetAndRakNet(unittest.TestCase):
         self.assertIsNone(bad_magic)
         self.assertIsNone(short_pkt)
 
+    def test_get_bound_tcp_ports_filters_listen_state_0a(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tcp4 = os.path.join(tmpdir, "tcp")
+            tcp6 = os.path.join(tmpdir, "tcp6")
+            with open(tcp4, "w", encoding="utf-8") as f:
+                f.write("  sl  local_address rem_address   st tx_queue rx_queue\n")
+                f.write("   0: 00000000:1F90 00000000:0000 0A 00000000:00000000\n")
+                f.write("   1: 0100007F:9999 0100007F:1F90 01 00000000:00000000\n")
+            with open(tcp6, "w", encoding="utf-8") as f:
+                f.write("  sl  local_address                         remote_address                        st\n")
+                f.write("   0: 00000000000000000000000000000000:4ABC 00000000000000000000000000000000:0000 0A\n")
+                f.write("   1: 00000000000000000000000000000000:4ABD 00000000000000000000000000000000:0000 06\n")
+
+            # Act
+            res = webui.get_bound_tcp_ports(proc_tcp=tcp4, proc_tcp6=tcp6)
+
+            # Assert
+            self.assertTrue(res["supported"])
+            self.assertIn(8080, res["ipv4_ports"])
+            self.assertNotIn(0x9999, res["ipv4_ports"])
+            self.assertIn(19132, res["ipv6_ports"])
+            self.assertNotIn(19133, res["ipv6_ports"])
+
+    def test_detect_bedrock_transport_variants(self):
+        # Arrange & Act & Assert
+        tcp_19132 = {"supported": True, "ipv4_ports": set(), "ipv6_ports": {19132}}
+        udp_none = {"supported": True, "ipv4_ports": {7551}, "ipv6_ports": set()}
+        udp_19132 = {"supported": True, "ipv4_ports": {19132}, "ipv6_ports": set()}
+        tcp_none = {"supported": True, "ipv4_ports": set(), "ipv6_ports": set()}
+
+        self.assertEqual(webui.detect_bedrock_transport({"transport": "nethernet"}, 19132, tcp_none, udp_19132), "nethernet")
+        self.assertEqual(webui.detect_bedrock_transport({"transport": "raknet"}, 19132, tcp_19132, udp_none), "raknet")
+        self.assertEqual(webui.detect_bedrock_transport({"server-udp-ports": "19132"}, 19132, tcp_none, udp_none), "nethernet")
+        self.assertEqual(webui.detect_bedrock_transport({}, 19132, tcp_19132, udp_none), "nethernet")
+        self.assertEqual(webui.detect_bedrock_transport({}, 19132, tcp_none, udp_19132), "raknet")
+
+    def test_probe_nethernet_http_live_and_ssrf_block(self):
+        # Arrange
+        class _JoinHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/v1/join":
+                    payload = b'{"name":"Dedicated Server","protocol":2225,"version":"1.26.66","level":"Bedrock level","players":1,"maxPlayers":10,"gameType":0}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _JoinHandler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            # Act
+            live_res = webui.probe_nethernet_http("127.0.0.1", port, pinned=False, timeout=2.0)
+            with mock.patch("webui.socket.create_connection") as mock_sock:
+                ssrf_res = webui.probe_nethernet_http("127.0.0.1", port, host_header="mc.example.com", pinned=True, timeout=2.0)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # Assert
+        self.assertTrue(live_res["online"])
+        self.assertEqual(live_res["version"], "1.26.66")
+        self.assertEqual(live_res["protocol"], "2225")
+        self.assertEqual(live_res["players"], 1)
+        self.assertEqual(live_res["max_players"], 10)
+        self.assertFalse(ssrf_res["online"])
+        self.assertEqual(ssrf_res["outcome"], "blocked")
+        mock_sock.assert_not_called()
+
 
 class TestChallengeAndSSRFProber(unittest.TestCase):
     """Tests for single-use verify tokens and SSRF protection in pinned HTTP probe."""
@@ -224,6 +302,16 @@ class TestChallengeAndSSRFProber(unittest.TestCase):
 
 class TestConnectivityDiagnosticPipeline(unittest.TestCase):
     """Tests for run_connectivity_diagnostics scenarios with mocked probes."""
+
+    def setUp(self):
+        self._tcp_patch = mock.patch("webui.get_bound_tcp_ports", return_value={"supported": True, "ipv4_ports": set(), "ipv6_ports": set()})
+        self._allow_patch = mock.patch("webui.read_allowlist", return_value=[])
+        self._tcp_patch.start()
+        self._allow_patch.start()
+
+    def tearDown(self):
+        self._allow_patch.stop()
+        self._tcp_patch.stop()
 
     def _base_patches(self):
         return {
@@ -352,6 +440,66 @@ class TestConnectivityDiagnosticPipeline(unittest.TestCase):
         self.assertEqual(by_id["external_bedrock_ipv6"]["status"], "PASS")
         self.assertEqual(mock_mc.call_count, 2)
         mock_mc.assert_any_call(v6_ip, 19133, is_ipv6=True)
+
+    def test_nethernet_healthy_pass_and_allowlist_populated(self):
+        # Arrange
+        parsed, _ = webui.parse_server_address("mc.wuffs.xyz")
+        props = {"server-port": "19132", "server-portv6": "19133", "transport": "nethernet", "server-udp-ports": "19132", "allow-list": "true"}
+        tcp_bound = {"supported": True, "ipv4_ports": set(), "ipv6_ports": {19132}}
+        udp_bound = {"supported": True, "ipv4_ports": {7551}, "ipv6_ports": set()}
+        join_ok = {"online": True, "outcome": "ok", "latency_ms": 1.5, "name": "Dedicated Server", "version": "1.26.66", "protocol": "2225", "level": "Bedrock level", "players": 0, "max_players": 10}
+        with mock.patch("webui.read_properties", return_value=props), \
+             mock.patch("webui.get_service_status", return_value="ACTIVE (RUNNING)"), \
+             mock.patch("webui.get_bound_tcp_ports", return_value=tcp_bound), \
+             mock.patch("webui.get_bound_udp_ports", return_value=udp_bound), \
+             mock.patch("webui.read_allowlist", return_value=[{"name": "PlayerOne"}]), \
+             mock.patch("webui.get_local_lan_ipv4", return_value="192.168.0.36"), \
+             mock.patch("webui.probe_nethernet_http", return_value=join_ok), \
+             mock.patch("webui.resolve_host_ips", return_value={"ipv4": ["90.202.94.179"], "ipv6": [], "non_public": [], "error": ""}), \
+             mock.patch("webui.fetch_public_ips", return_value={"ipv4": "90.202.94.179", "ipv6": "", "error": ""}), \
+             mock.patch("webui.probe_external_bedrock", return_value={"reachable_api": True, "provider": "api.mcstatus.io", "online": False, "version": "", "motd": "", "players_online": 0, "players_max": 0, "server_guid": "", "error": ""}), \
+             mock.patch("webui.probe_webui_endpoint", return_value={"verified": True, "outcome": "verified", "status_code": 200}):
+            # Act
+            report = webui.run_connectivity_diagnostics(parsed)
+
+        # Assert
+        by_id = {c["id"]: c for c in report["checks"]}
+        self.assertEqual(report["transport"], "nethernet")
+        self.assertEqual(report["overall_status"], "PASS")
+        self.assertEqual(by_id["local_udp_binding"]["status"], "PASS")
+        self.assertEqual(by_id["local_raknet_ping"]["status"], "PASS")
+        self.assertEqual(by_id["allowlist_readiness"]["status"], "PASS")
+        self.assertEqual(by_id["external_bedrock_udp"]["status"], "PASS")
+
+    def test_nethernet_hairpin_timeout_and_empty_allowlist_warn(self):
+        # Arrange
+        parsed, _ = webui.parse_server_address("mc.wuffs.xyz")
+        props = {"server-port": "19132", "server-portv6": "19133", "transport": "nethernet", "server-udp-ports": "19132", "allow-list": "true"}
+        tcp_bound = {"supported": True, "ipv4_ports": set(), "ipv6_ports": {19132}}
+        udp_bound = {"supported": True, "ipv4_ports": {7551}, "ipv6_ports": set()}
+        join_local = {"online": True, "outcome": "ok", "latency_ms": 1.1, "name": "Dedicated Server", "version": "1.26.66", "protocol": "2225", "level": "Bedrock level", "players": 0, "max_players": 10}
+        join_timeout = {"online": False, "outcome": "timeout", "error": "HTTP timeout"}
+        with mock.patch("webui.read_properties", return_value=props), \
+             mock.patch("webui.get_service_status", return_value="ACTIVE (RUNNING)"), \
+             mock.patch("webui.get_bound_tcp_ports", return_value=tcp_bound), \
+             mock.patch("webui.get_bound_udp_ports", return_value=udp_bound), \
+             mock.patch("webui.read_allowlist", return_value=[]), \
+             mock.patch("webui.get_local_lan_ipv4", return_value="192.168.0.36"), \
+             mock.patch("webui.probe_nethernet_http", side_effect=[join_local, join_timeout]), \
+             mock.patch("webui.resolve_host_ips", return_value={"ipv4": ["90.202.94.179"], "ipv6": [], "non_public": [], "error": ""}), \
+             mock.patch("webui.fetch_public_ips", return_value={"ipv4": "90.202.94.179", "ipv6": "", "error": ""}), \
+             mock.patch("webui.probe_external_bedrock", return_value={"reachable_api": True, "provider": "api.mcsrvstat.us", "online": False, "version": "", "motd": "", "players_online": 0, "players_max": 0, "server_guid": "", "error": ""}), \
+             mock.patch("webui.probe_webui_endpoint", return_value={"verified": False, "outcome": "timeout", "status_code": 0}):
+            # Act
+            report = webui.run_connectivity_diagnostics(parsed)
+
+        # Assert
+        by_id = {c["id"]: c for c in report["checks"]}
+        self.assertEqual(report["overall_status"], "WARN")
+        self.assertEqual(by_id["allowlist_readiness"]["status"], "WARN")
+        self.assertEqual(by_id["external_bedrock_udp"]["status"], "WARN")
+        self.assertIn("TCP and UDP port 19132", by_id["external_bedrock_udp"]["remediation"])
+        self.assertIn("NAT hairpinning", by_id["external_bedrock_udp"]["detail"])
 
 
 class TestWebUIServerIntegration(unittest.TestCase):
@@ -631,6 +779,10 @@ class TestReinstallControlsAndInstallerSync(unittest.TestCase):
         self.assertEqual(len(sudoers_line), 1)
         self.assertNotIn("*", sudoers_line[0])
         self.assertIn("git", sh_text.split("install_system_dependencies()", 1)[1].split("}", 1)[0])
+        fw_block = sh_text.split("configure_firewall()", 1)[1].split("}", 1)[0]
+        self.assertIn("19132/tcp", fw_block)
+        self.assertIn("19133/tcp", fw_block)
+        self.assertIn("7551/udp", fw_block)
 
 
 if __name__ == "__main__":

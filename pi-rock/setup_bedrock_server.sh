@@ -1439,6 +1439,8 @@ VALID_PROPERTIES = {
     "allow-list": ["true", "false"],
     "server-port": int,
     "server-portv6": int,
+    "transport": ["nethernet", "raknet"],
+    "server-udp-ports": str,
     "view-distance": int,
     "tick-distance": int,
     "player-idle-timeout": int,
@@ -2052,8 +2054,8 @@ def get_local_lan_ipv4():
         sock.close()
 
 
-def _read_proc_udp_ports(filepath):
-    """Read listening UDP port numbers from a Linux /proc/net/udp* table."""
+def _read_proc_socket_ports(filepath, state_filter=None):
+    """Read socket port numbers from a Linux /proc/net/{tcp,udp}* table."""
     ports = set()
     if not os.path.exists(filepath):
         return False, ports
@@ -2065,6 +2067,8 @@ def _read_proc_udp_ports(filepath):
                 if idx == 0:
                     continue
                 parts = line.split()
+                if state_filter is not None and (len(parts) < 4 or parts[3].upper() != state_filter):
+                    continue
                 if len(parts) >= 2 and ":" in parts[1]:
                     port_hex = parts[1].rsplit(":", 1)[1]
                     if re.match(r"^[0-9a-fA-F]{1,4}$", port_hex):
@@ -2076,13 +2080,86 @@ def _read_proc_udp_ports(filepath):
 
 def get_bound_udp_ports(proc_udp="/proc/net/udp", proc_udp6="/proc/net/udp6"):
     """Return local UDP socket ports from procfs when running on Linux."""
-    ok4, ports4 = _read_proc_udp_ports(proc_udp)
-    ok6, ports6 = _read_proc_udp_ports(proc_udp6)
+    ok4, ports4 = _read_proc_socket_ports(proc_udp, state_filter=None)
+    ok6, ports6 = _read_proc_socket_ports(proc_udp6, state_filter=None)
     return {
         "supported": ok4 or ok6,
         "ipv4_ports": ports4,
         "ipv6_ports": ports6,
     }
+
+
+def get_bound_tcp_ports(proc_tcp="/proc/net/tcp", proc_tcp6="/proc/net/tcp6"):
+    """Return local listening (TCP_LISTEN state 0A) TCP ports from procfs."""
+    ok4, ports4 = _read_proc_socket_ports(proc_tcp, state_filter="0A")
+    ok6, ports6 = _read_proc_socket_ports(proc_tcp6, state_filter="0A")
+    return {
+        "supported": ok4 or ok6,
+        "ipv4_ports": ports4,
+        "ipv6_ports": ports6,
+    }
+
+
+def detect_bedrock_transport(props, prop_v4, tcp_info, udp_info):
+    """Identify whether the server runs NetherNet (1.26.60+) or legacy RakNet."""
+    explicit = str(props.get("transport", "")).strip().lower()
+    if explicit in ("nethernet", "raknet"):
+        return explicit
+    if str(props.get("server-udp-ports", "")).strip():
+        return "nethernet"
+    if tcp_info.get("supported"):
+        tcp_listening = prop_v4 in (tcp_info["ipv4_ports"] | tcp_info["ipv6_ports"])
+        udp_listening = prop_v4 in (udp_info["ipv4_ports"] | udp_info["ipv6_ports"])
+        if tcp_listening and not udp_listening:
+            return "nethernet"
+    return "raknet"
+
+
+def probe_nethernet_http(target_ip, port, host_header=None, pinned=False, timeout=2.0):
+    """Probe Bedrock NetherNet HTTP signaling endpoint GET /v1/join safely."""
+    if pinned and not is_public_global_ip(target_ip):
+        return {"online": False, "outcome": "blocked", "error": "SSRF blocked"}
+    conn = None
+    try:
+        if pinned:
+            conn = _PinnedHTTPConnection(host_header or target_ip, port=port, pinned_ip=target_ip, timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(target_ip, port=port, timeout=timeout)
+        start = time.monotonic()
+        conn.request("GET", "/v1/join", headers={"User-Agent": PROBE_USER_AGENT, "Connection": "close"})
+        resp = conn.getresponse()
+        body = resp.read(4096)
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+        if resp.status != 200:
+            return {"online": False, "outcome": "mismatch", "error": f"HTTP {resp.status}"}
+        payload = json.loads(body.decode("utf-8", errors="strict"))
+        if not isinstance(payload, dict) or ("version" not in payload and "protocol" not in payload):
+            return {"online": False, "outcome": "mismatch", "error": "Invalid /v1/join JSON"}
+        return {
+            "online": True,
+            "outcome": "ok",
+            "latency_ms": elapsed_ms,
+            "name": str(payload.get("name") or ""),
+            "version": str(payload.get("version") or ""),
+            "protocol": str(payload.get("protocol") or ""),
+            "level": str(payload.get("level") or ""),
+            "players": payload.get("players", 0),
+            "max_players": payload.get("maxPlayers", 0),
+        }
+    except (socket.timeout, TimeoutError):
+        return {"online": False, "outcome": "timeout", "error": "HTTP timeout"}
+    except ConnectionRefusedError:
+        return {"online": False, "outcome": "refused", "error": "Connection refused"}
+    except (ValueError, TypeError):
+        return {"online": False, "outcome": "mismatch", "error": "Invalid JSON response"}
+    except OSError as exc:
+        return {"online": False, "outcome": "error", "error": str(exc.strerror or type(exc).__name__)}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def build_raknet_ping_packet(client_guid=None):
@@ -2471,13 +2548,36 @@ def _check_bedrock_service():
     )
 
 
-def _check_local_udp_binding(prop_v4, prop_v6):
-    """Check local UDP port bindings in /proc/net/udp and /proc/net/udp6."""
-    udp = get_bound_udp_ports()
-    if not udp["supported"]:
+def _check_local_udp_binding(prop_v4, prop_v6, transport, tcp_info, udp_info, props):
+    """Check local Bedrock TCP/UDP socket bindings for NetherNet or RakNet."""
+    if transport == "nethernet":
+        if not tcp_info["supported"]:
+            return _make_check("local_udp_binding", "Local Host", "Local NetherNet Socket Binding", "INFO", "Local procfs TCP/UDP tables are unavailable on this OS."), False
+        tcp_bound = prop_v4 in (tcp_info["ipv4_ports"] | tcp_info["ipv6_ports"])
+        lan_disc = 7551 in (udp_info["ipv4_ports"] | udp_info["ipv6_ports"])
+        udp_ports_cfg = str(props.get("server-udp-ports", str(prop_v4))).strip()
+        if tcp_bound:
+            disc_note = "LAN discovery UDP 7551 active." if lan_disc else "LAN discovery UDP 7551 not detected."
+            return _make_check(
+                "local_udp_binding",
+                "Local Host",
+                "Local NetherNet Socket Binding",
+                "PASS",
+                f"NetherNet TCP signaling port {prop_v4} is listening (server-udp-ports={udp_ports_cfg}). {disc_note}",
+            ), prop_v4 in tcp_info["ipv6_ports"]
+        return _make_check(
+            "local_udp_binding",
+            "Local Host",
+            "Local NetherNet Socket Binding",
+            "FAIL",
+            f"No process is listening on local NetherNet TCP port {prop_v4}.",
+            f"Confirm {SERVICE_NAME} is running and server-port matches {prop_v4}.",
+        ), False
+
+    if not udp_info["supported"]:
         return _make_check("local_udp_binding", "Local Host", "Local UDP Socket Binding", "INFO", "Local procfs UDP table is unavailable on this operating system."), False
-    v4_bound = prop_v4 in udp["ipv4_ports"] or prop_v4 in udp["ipv6_ports"]
-    v6_bound = prop_v6 in udp["ipv6_ports"]
+    v4_bound = prop_v4 in udp_info["ipv4_ports"] or prop_v4 in udp_info["ipv6_ports"]
+    v6_bound = prop_v6 in udp_info["ipv6_ports"]
     if v4_bound:
         v6_note = f"IPv6 UDP port {prop_v6} is also bound." if v6_bound else f"IPv6 UDP port {prop_v6} is not bound."
         return _make_check("local_udp_binding", "Local Host", "Local UDP Socket Binding", "PASS", f"Local UDP port {prop_v4} is listening. {v6_note}"), v6_bound
@@ -2491,8 +2591,28 @@ def _check_local_udp_binding(prop_v4, prop_v6):
     ), v6_bound
 
 
-def _check_local_raknet(prop_v4, prop_v6, lan_ip, v6_bound):
-    """Execute a local RakNet UDP ping against loopback (and LAN IP fallback)."""
+def _check_local_raknet(prop_v4, prop_v6, lan_ip, v6_bound, transport):
+    """Execute local loopback handshake for NetherNet HTTP (/v1/join) or RakNet UDP."""
+    if transport == "nethernet":
+        res = probe_nethernet_http("127.0.0.1", prop_v4, timeout=2.0)
+        if not res["online"] and lan_ip != "Unavailable":
+            res = probe_nethernet_http(lan_ip, prop_v4, timeout=2.0)
+        if res["online"]:
+            detail = (
+                f"Local NetherNet /v1/join responded on TCP {prop_v4} in {res['latency_ms']} ms "
+                f"(Version: {res['version'] or 'unknown'}, Protocol: {res['protocol'] or '?'}, "
+                f"Players: {res['players']}/{res['max_players']})."
+            )
+            return _make_check("local_raknet_ping", "Local Host", "Local NetherNet Signaling (/v1/join)", "PASS", detail), ""
+        return _make_check(
+            "local_raknet_ping",
+            "Local Host",
+            "Local NetherNet Signaling (/v1/join)",
+            "FAIL",
+            f"Local NetherNet /v1/join probe on TCP {prop_v4} failed ({res.get('error', 'no response')}).",
+            f"Verify {SERVICE_NAME} finished booting and allows TCP {prop_v4} locally.",
+        ), ""
+
     res = probe_raknet_udp("127.0.0.1", prop_v4, ipv6=False, timeout=2.0)
     if not res["online"] and lan_ip != "Unavailable":
         res = probe_raknet_udp(lan_ip, prop_v4, ipv6=False, timeout=2.0)
@@ -2511,6 +2631,24 @@ def _check_local_raknet(prop_v4, prop_v6, lan_ip, v6_bound):
         f"Local RakNet ping to UDP {prop_v4} failed ({res.get('error', 'no response')}).",
         f"Verify {SERVICE_NAME} is running and allow local UDP {prop_v4} in UFW.",
     ), ""
+
+
+def _check_allowlist_readiness(props):
+    """Warn operators if allowlist enforcement is enabled with zero players."""
+    enabled = str(props.get("allow-list", props.get("white-list", "false"))).strip().lower() == "true"
+    if not enabled:
+        return _make_check("allowlist_readiness", "Access Policy", "Allowlist Readiness", "INFO", "Allowlist enforcement (allow-list) is disabled; any player with the address may join.")
+    entries = read_allowlist()
+    if len(entries) == 0:
+        return _make_check(
+            "allowlist_readiness",
+            "Access Policy",
+            "Allowlist Readiness",
+            "WARN",
+            "Allowlist enforcement (allow-list=true) is enabled with 0 authorized players. All join attempts will be rejected.",
+            "Add your Xbox Gamertag under Player Access Control below, or set allow-list to false in server.properties.",
+        )
+    return _make_check("allowlist_readiness", "Access Policy", "Allowlist Readiness", "PASS", f"Allowlist enforcement enabled with {len(entries)} authorized player(s).")
 
 
 def _check_dns_resolution(host, addr_type):
@@ -2589,12 +2727,61 @@ def _check_wan_alignment(resolved, wan_info, ssrf_blocked):
     ), False
 
 
-def _check_external_bedrock_v4(host, addr_type, resolved, target_port, prop_v4, lan_ip, local_guid, ssrf_blocked):
-    """Check external Bedrock IPv4/domain UDP reachability via public RakNet scanners."""
+def _probe_external_nethernet(check_id, label, target_ip, host, api_target, target_port, prop_port, wan_ip, lan_ip, udp_ports_cfg, is_ipv6=False, v4_passed=False):
+    """Verify external NetherNet HTTP signaling (/v1/join) with legacy API fallback."""
+    net_ext = probe_nethernet_http(target_ip, target_port, host_header=host, pinned=True, timeout=4.0)
+    api_ext = probe_external_bedrock(api_target, target_port, is_ipv6=is_ipv6)
+    target_disp = f"[{target_ip}]:{target_port}" if is_ipv6 else f"{host}:{target_port}"
+    if net_ext["online"]:
+        return _make_check(
+            check_id,
+            "External Game Access",
+            label,
+            "PASS",
+            f"External NetherNet /v1/join verified at {target_disp} in {net_ext['latency_ms']} ms "
+            f"(Version: {net_ext['version'] or 'unknown'}, Players: {net_ext['players']}/{net_ext['max_players']}). "
+            f"Ensure UDP {udp_ports_cfg} is also forwarded for WebRTC gameplay.",
+        )
+    if api_ext["reachable_api"] and api_ext["online"]:
+        return _make_check(
+            check_id,
+            "External Game Access",
+            label,
+            "PASS",
+            f"External Bedrock verified via {api_ext['provider']} at {target_disp} (Version: {api_ext['version'] or 'unknown'}).",
+        )
+    if net_ext["outcome"] == "timeout" and wan_ip and target_ip == wan_ip:
+        return _make_check(
+            check_id,
+            "External Game Access",
+            label,
+            "WARN",
+            f"NetherNet /v1/join timed out at {target_disp} and legacy scanners reported offline (router blocks NAT hairpinning or port {prop_port} is closed).",
+            f"Forward both TCP and UDP port {prop_port} (and UDP {udp_ports_cfg}) on your router to {lan_ip}, then test joining on mobile cellular data.",
+        )
+    fail_level = "WARN" if (is_ipv6 and v4_passed) else "FAIL"
+    return _make_check(
+        check_id,
+        "External Game Access",
+        label,
+        fail_level,
+        f"External NetherNet probe failed at {target_disp} (/v1/join: {net_ext['outcome']}).",
+        f"Forward both TCP and UDP port {prop_port} (and UDP {udp_ports_cfg}) on your router to {lan_ip} and check UFW/ISP CGNAT.",
+    )
+
+
+def _check_external_bedrock_v4(host, addr_type, resolved, target_port, prop_v4, lan_ip, local_guid, ssrf_blocked, transport="raknet", wan_info=None, udp_ports_cfg="19132"):
+    """Check external Bedrock IPv4/domain reachability for NetherNet or RakNet."""
     if ssrf_blocked:
-        return _make_check("external_bedrock_udp", "External Game Access", "External Bedrock UDP (IPv4)", "FAIL", "Skipped external Bedrock probe because DNS resolution failed or was blocked.")
+        return _make_check("external_bedrock_udp", "External Game Access", "External Bedrock Access (IPv4)", "FAIL", "Skipped external Bedrock probe because DNS resolution failed or was blocked.")
     if addr_type == "ipv6" or (not resolved["ipv4"] and resolved["ipv6"]):
-        return _make_check("external_bedrock_udp", "External Game Access", "External Bedrock UDP (IPv4)", "INFO", "Target has no IPv4 address; IPv4 probe skipped (see IPv6 check).")
+        return _make_check("external_bedrock_udp", "External Game Access", "External Bedrock Access (IPv4)", "INFO", "Target has no IPv4 address; IPv4 probe skipped (see IPv6 check).")
+    if transport == "nethernet":
+        wan_v4 = (wan_info or {}).get("ipv4", "")
+        return _probe_external_nethernet(
+            "external_bedrock_udp", "External Bedrock NetherNet (IPv4)",
+            resolved["ipv4"][0], host, host, target_port, prop_v4, wan_v4, lan_ip, udp_ports_cfg, is_ipv6=False,
+        )
 
     ext = probe_external_bedrock(host, target_port, is_ipv6=False)
     if not ext["reachable_api"]:
@@ -2633,13 +2820,19 @@ def _check_external_bedrock_v4(host, addr_type, resolved, target_port, prop_v4, 
     )
 
 
-def _check_external_bedrock_v6(resolved, target_port_v6, prop_v6, ssrf_blocked, v4_passed):
-    """Check external Bedrock IPv6 UDP reachability when an IPv6 target or AAAA exists."""
+def _check_external_bedrock_v6(resolved, target_port_v6, prop_v6, ssrf_blocked, v4_passed, transport="raknet", wan_info=None, host="", lan_ip="Unavailable", udp_ports_cfg="19133"):
+    """Check external Bedrock IPv6 reachability when an IPv6 target or AAAA exists."""
     if ssrf_blocked:
-        return _make_check("external_bedrock_ipv6", "External Game Access", "External Bedrock UDP (IPv6)", "INFO", "Skipped external IPv6 probe because DNS resolution failed or was blocked.")
+        return _make_check("external_bedrock_ipv6", "External Game Access", "External Bedrock Access (IPv6)", "INFO", "Skipped external IPv6 probe because DNS resolution failed or was blocked.")
     if not resolved["ipv6"]:
-        return _make_check("external_bedrock_ipv6", "External Game Access", "External Bedrock UDP (IPv6)", "INFO", "No IPv6 address or AAAA record configured; IPv6 probe skipped.")
+        return _make_check("external_bedrock_ipv6", "External Game Access", "External Bedrock Access (IPv6)", "INFO", "No IPv6 address or AAAA record configured; IPv6 probe skipped.")
     ipv6_addr = resolved["ipv6"][0]
+    if transport == "nethernet":
+        wan_v6 = (wan_info or {}).get("ipv6", "")
+        return _probe_external_nethernet(
+            "external_bedrock_ipv6", "External Bedrock NetherNet (IPv6)",
+            ipv6_addr, host or ipv6_addr, ipv6_addr, target_port_v6, prop_v6, wan_v6, lan_ip, udp_ports_cfg, is_ipv6=True, v4_passed=v4_passed,
+        )
     ext6 = probe_external_bedrock(ipv6_addr, target_port_v6, is_ipv6=True)
     if not ext6["reachable_api"]:
         return _make_check("external_bedrock_ipv6", "External Game Access", "External Bedrock UDP (IPv6)", "WARN", f"External IPv6 Bedrock probe unavailable ({ext6['error']}).")
@@ -2713,50 +2906,44 @@ def _check_external_webui(host, resolved, wan_info, ssrf_blocked):
 
 
 def run_connectivity_diagnostics(parsed_address):
-    """Run ordered local, DNS, WAN, Bedrock UDP, and Web UI external checks."""
+    """Run ordered local, allowlist, DNS, WAN, Bedrock, and Web UI checks."""
     props = read_properties()
     prop_v4 = _safe_int_prop(props, "server-port", 19132)
     prop_v6 = _safe_int_prop(props, "server-portv6", 19133)
     port_override = parsed_address.get("port_override")
-    target_v4_port = port_override if port_override else prop_v4
-    target_v6_port = port_override if port_override else prop_v6
-    host = parsed_address["host"]
-    addr_type = parsed_address["address_type"]
+    target_v4_port = port_override or prop_v4
+    target_v6_port = port_override or prop_v6
+    host, addr_type = parsed_address["host"], parsed_address["address_type"]
     lan_ip = get_local_lan_ipv4()
+    tcp_info, udp_info = get_bound_tcp_ports(), get_bound_udp_ports()
+    transport = detect_bedrock_transport(props, prop_v4, tcp_info, udp_info)
+    udp_ports_cfg = str(props.get("server-udp-ports", str(prop_v4))).strip()
 
-    checks = []
-    checks.append(_check_bedrock_service())
-    udp_chk, v6_bound = _check_local_udp_binding(prop_v4, prop_v6)
-    checks.append(udp_chk)
-    rak_chk, local_guid = _check_local_raknet(prop_v4, prop_v6, lan_ip, v6_bound)
-    checks.append(rak_chk)
-
+    bind_chk, v6_bound = _check_local_udp_binding(prop_v4, prop_v6, transport, tcp_info, udp_info, props)
+    local_chk, local_guid = _check_local_raknet(prop_v4, prop_v6, lan_ip, v6_bound, transport)
+    allow_chk = _check_allowlist_readiness(props)
     dns_chk, resolved, ssrf_blocked = _check_dns_resolution(host, addr_type)
-    checks.append(dns_chk)
-
     wan_info = fetch_public_ips()
     wan_chk, cf_proxied = _check_wan_alignment(resolved, wan_info, ssrf_blocked)
-    checks.append(wan_chk)
-
-    v4_chk = _check_external_bedrock_v4(host, addr_type, resolved, target_v4_port, prop_v4, lan_ip, local_guid, ssrf_blocked)
-    checks.append(v4_chk)
+    v4_chk = _check_external_bedrock_v4(host, addr_type, resolved, target_v4_port, prop_v4, lan_ip, local_guid, ssrf_blocked, transport=transport, wan_info=wan_info, udp_ports_cfg=udp_ports_cfg)
     v4_passed = v4_chk["status"] == "PASS"
+    v6_chk = _check_external_bedrock_v6(resolved, target_v6_port, prop_v6, ssrf_blocked, v4_passed, transport=transport, wan_info=wan_info, host=host, lan_ip=lan_ip, udp_ports_cfg=udp_ports_cfg)
 
-    v6_chk = _check_external_bedrock_v6(resolved, target_v6_port, prop_v6, ssrf_blocked, v4_passed)
-    checks.append(v6_chk)
-    v6_passed = v6_chk["status"] == "PASS"
-
-    if wan_chk["status"] == "WARN" and not cf_proxied and (v4_passed or v6_passed):
+    if wan_chk["status"] == "WARN" and not cf_proxied and (v4_passed or v6_chk["status"] == "PASS"):
         wan_chk["status"] = "PASS"
-        wan_chk["detail"] = f"Resolved IP differs from host WAN IP, and external Bedrock UDP succeeded (UDP tunnel/relay topology such as playit.gg detected)."
+        wan_chk["detail"] = "Resolved IP differs from host WAN IP, and external Bedrock reachability succeeded (tunnel/relay topology detected)."
         wan_chk["remediation"] = ""
 
-    checks.append(_check_external_webui(host, resolved, wan_info, ssrf_blocked))
-
+    checks = [
+        _check_bedrock_service(), bind_chk, local_chk, allow_chk,
+        dns_chk, wan_chk, v4_chk, v6_chk,
+        _check_external_webui(host, resolved, wan_info, ssrf_blocked),
+    ]
     statuses = [c["status"] for c in checks]
     overall = "FAIL" if "FAIL" in statuses else ("WARN" if "WARN" in statuses else "PASS")
     return {
         "overall_status": overall,
+        "transport": transport,
         "checked_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "lan_ip": lan_ip,
         "wan_ipv4": wan_info.get("ipv4", ""),
@@ -2895,6 +3082,7 @@ def _render_address_report_html(address_cfg, report, props):
     lan_disp = html_lib.escape(report.get("lan_ip") or "Unavailable")
     wan_disp = html_lib.escape(report.get("wan_ipv4") or report.get("wan_ipv6") or "Unavailable")
     checked_disp = html_lib.escape(report.get("checked_utc") or address_cfg.get("last_checked_utc") or "")
+    transport_disp = html_lib.escape(str(report.get("transport") or "unknown").upper())
 
     rows = []
     for chk in report.get("checks", []):
@@ -2909,7 +3097,7 @@ def _render_address_report_html(address_cfg, report, props):
     return f"""
         <div class="grid-3" style="margin: 15px 0;">
           <div class="stat-box">
-            <div class="stat-label">Minecraft Join Address</div>
+            <div class="stat-label">Minecraft Join Address ({transport_disp})</div>
             <div class="stat-val" style="font-size:15px;"><code>{escaped_join}</code></div>
             <div class="stat-sub"><button type="button" class="btn btn-primary btn-sm" style="margin-top:6px;" data-copy="{escaped_join}" onclick="copyJoinAddress(this)">Copy Join Address</button></div>
           </div>
@@ -3878,9 +4066,12 @@ configure_firewall() {
     log_info "Configuring network firewall rules..."
     if command -v ufw >/dev/null 2>&1; then
         ufw allow 19132/udp comment "Minecraft Bedrock IPv4" || true
+        ufw allow 19132/tcp comment "Minecraft Bedrock NetherNet IPv4" || true
         ufw allow 19133/udp comment "Minecraft Bedrock IPv6" || true
+        ufw allow 19133/tcp comment "Minecraft Bedrock NetherNet IPv6" || true
+        ufw allow 7551/udp comment "Minecraft Bedrock NetherNet LAN Discovery" || true
         ufw allow 8080/tcp comment "Minecraft Bedrock Web UI" || true
-        log_info "Firewall rules for UDP 19132/19133 and TCP 8080 applied."
+        log_info "Firewall rules for TCP/UDP 19132/19133, UDP 7551, and TCP 8080 applied."
     fi
 }
 

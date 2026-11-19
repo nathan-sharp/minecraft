@@ -133,10 +133,14 @@ To allow external players to connect over the Wide Area Network (WAN), configure
 
 ### 6.1 Network Port Allocation
 
+Minecraft Bedrock Dedicated Server (BDS) `1.26.60+` uses the **NetherNet** transport (`transport=nethernet`) over Transmission Control Protocol (TCP) and User Datagram Protocol (UDP) instead of legacy RakNet (`transport=raknet`).
+
 | Protocol | Port Number | Direction | Purpose |
 | :--- | :--- | :--- | :--- |
-| **UDP** | `19132` | Inbound | Minecraft Bedrock IPv4 Client Connections |
-| **UDP** | `19133` | Inbound | Minecraft Bedrock IPv6 Client Connections |
+| **TCP** | `19132` | Inbound | NetherNet IPv4 Signaling Handshake (`/v1/join`) |
+| **UDP** | `19132` (or `server-udp-ports`) | Inbound | NetherNet Web Real-Time Communication (WebRTC) / Legacy RakNet IPv4 Gameplay |
+| **TCP / UDP** | `19133` | Inbound | Minecraft Bedrock IPv6 Signaling and Gameplay |
+| **UDP** | `7551` | Inbound (LAN) | NetherNet Local Area Network (LAN) Discovery Broadcast |
 
 ### 6.2 Router Port Forwarding Procedure
 
@@ -144,7 +148,7 @@ To allow external players to connect over the Wide Area Network (WAN), configure
 2. Navigate to the **Port Forwarding**, **Virtual Server**, or **NAT** configuration section.
 3. Create a new Port Forwarding rule.
 4. Set the **Service Name** to `MinecraftBedrock`.
-5. Set the **Protocol** to `UDP`.
+5. Set the **Protocol** to `TCP/UDP` (or `Both`).
 6. Set the **External Port** to `19132`.
 7. Set the **Internal Port** to `19132`.
 8. Set the **Internal IP Address** to the static IP address of your Raspberry Pi.
@@ -152,7 +156,7 @@ To allow external players to connect over the Wide Area Network (WAN), configure
 
 ### 6.3 Custom Domain Configuration via Cloudflare DNS
 
-Standard Cloudflare Tunnels (`cloudflared`) do not support inbound User Datagram Protocol (UDP) game traffic for public players. Minecraft Bedrock Edition uses UDP exclusively (port 19132).
+Standard Cloudflare Tunnels (`cloudflared`) do not support inbound User Datagram Protocol (UDP) WebRTC game traffic for public players. Minecraft Bedrock Edition requires direct UDP connectivity alongside TCP signaling.
 
 To connect a custom domain to your Minecraft server, use **Cloudflare DNS** with an unproxied `A` record combined with standard router port forwarding.
 
@@ -432,9 +436,10 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
 - **Service Monitoring & Lifecycle**: Real-time daemon status with Start, Stop, Restart, and Backup triggers.
 - **Address & Connectivity Management**:
   - Single-field configuration supporting Fully Qualified Domain Names (FQDN), public IPv4 addresses, and public IPv6 addresses with optional `:port` overrides.
-  - Automated eight-stage connectivity check triggered on address save and manual Re-check.
-  - Local verification of `minecraft-bedrock.service`, `/proc/net/udp` socket bindings, and local RakNet UDP ping responses.
-  - Public Domain Name System (DNS) resolution, Wide Area Network (WAN) IP matching, Cloudflare Proxy detection, and User Datagram Protocol (UDP) tunnel detection.
+  - Automated nine-stage connectivity check triggered on address save and manual Re-check.
+  - Auto-detects **NetherNet** (`transport=nethernet`) vs. **RakNet** (`transport=raknet`).
+  - Local verification of `minecraft-bedrock.service`, `/proc/net/tcp` and `/proc/net/udp` socket bindings, local `/v1/join` HTTP or RakNet UDP loopback, and allowlist readiness.
+  - Public Domain Name System (DNS) resolution, Wide Area Network (WAN) IP matching, Cloudflare Proxy detection, and UDP tunnel detection.
   - External Bedrock reachability probes (IPv4 and IPv6) and external Web UI self-verification over Hypertext Transfer Protocol Secure (HTTPS) and Hypertext Transfer Protocol (HTTP).
 - **Software Version & Force Reinstall**:
   - Displays the installed Git commit SHA, last update status, and timestamp from `/opt/minecraft/webui/update_status.json`.
@@ -481,19 +486,20 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
 1. Open the **Address & Connectivity Management** card in the Web UI.
 2. Enter your custom domain or public IP address (optional `:port`).
 3. Click **Save & Check Connectivity**.
-4. Review the eight diagnostic stages in the results table.
+4. Review the nine diagnostic stages in the results table.
 5. Resolve any `FAIL` or `WARN` items using the listed remediation steps.
 6. Click **Re-check Now** to re-run verification after router or DNS updates.
 
 | Stage | Target | Pass Criterion |
 | :--- | :--- | :--- |
 | **Bedrock Service Process** | `minecraft-bedrock.service` | Service reports active running state. |
-| **Local UDP Socket Binding** | `/proc/net/udp` and `/proc/net/udp6` | Configured `server-port` (default UDP `19132`) is bound. |
-| **Local RakNet Loopback** | `127.0.0.1` and `::1` | Local server returns a RakNet Unconnected Pong packet. |
+| **Local Socket Binding** | `/proc/net/tcp` and `/proc/net/udp` | Listening TCP `server-port` (NetherNet) or UDP `server-port` (RakNet) is bound. |
+| **Local Loopback Handshake** | `127.0.0.1` and `::1` | Local server returns HTTP `200` on `/v1/join` (NetherNet) or RakNet pong (RakNet). |
+| **Allowlist Readiness** | `server.properties` and `allowlist.json` | Warns if `allow-list=true` with zero authorized players. |
 | **DNS & Public IP Validation** | DNS `A` and `AAAA` records | Address resolves strictly to public globally routable IPs. |
-| **WAN IP & Proxy Alignment** | Host public WAN IP | Matches WAN IP or active UDP tunnel; rejects Cloudflare Orange Cloud IPs. |
-| **External Bedrock UDP (IPv4)** | External RakNet scanner | External scanner receives RakNet pong matching local server GUID. |
-| **External Bedrock UDP (IPv6)** | External IPv6 RakNet scanner | Tested when an IPv6 literal or `AAAA` record exists. |
+| **WAN IP & Proxy Alignment** | Host public WAN IP | Matches WAN IP or active tunnel; rejects Cloudflare Orange Cloud IPs. |
+| **External Bedrock Access (IPv4)** | `/v1/join` or external scanner | Remote NetherNet `/v1/join` or external RakNet scanner responds. |
+| **External Bedrock Access (IPv6)** | IPv6 `/v1/join` or scanner | Tested when an IPv6 literal or `AAAA` record exists. |
 | **External Web UI Reachability** | `https://<host>` and `http://<host>:8080` | `PASS` for verified Transport Layer Security (TLS) on port `443`; `WARN` for plaintext HTTP on port `8080`. |
 
 #### Procedure: Force Reinstalling Pi-Rock from the Web UI
