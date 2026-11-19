@@ -7,6 +7,7 @@ Follows strict Arrange-Act-Assert (AAA) structure with pure Python standard libr
 import base64
 import http.client
 import http.server
+import io
 import json
 import os
 import socket
@@ -14,7 +15,9 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import zipfile
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -806,6 +809,365 @@ class TestReinstallControlsAndInstallerSync(unittest.TestCase):
         self.assertNotIn("white-list", updated)
         self.assertEqual(warn_chk["status"], "WARN")
         self.assertIn("white-list=true", warn_chk["detail"])
+
+
+class TestExternalUSBBackupStorage(unittest.TestCase):
+    """Tests for USB drive detection, auto-mounting, fallback, uncompressed backups, and Web UI controls."""
+
+    def test_detect_external_usb_drives_filters_system_and_identifies_windows_fs(self):
+        # Arrange
+        lsblk_payload = {
+            "blockdevices": [
+                {
+                    "name": "mmcblk0", "kname": "mmcblk0", "path": "/dev/mmcblk0",
+                    "tran": None, "rm": False, "hotplug": False, "type": "disk",
+                    "fstype": None, "label": None, "uuid": None, "size": 32000000000,
+                    "mountpoint": None,
+                    "children": [
+                        {
+                            "name": "mmcblk0p1", "kname": "mmcblk0p1", "path": "/dev/mmcblk0p1",
+                            "tran": None, "type": "part", "fstype": "vfat", "label": "bootfs",
+                            "uuid": "BOOT-1", "size": 536870912, "mountpoint": "/boot/firmware",
+                        },
+                        {
+                            "name": "mmcblk0p2", "kname": "mmcblk0p2", "path": "/dev/mmcblk0p2",
+                            "tran": None, "type": "part", "fstype": "ext4", "label": "rootfs",
+                            "uuid": "ROOT-2", "size": 31000000000, "mountpoint": "/",
+                        },
+                    ],
+                },
+                {
+                    "name": "sda", "kname": "sda", "path": "/dev/sda",
+                    "tran": "usb", "rm": True, "hotplug": True, "type": "disk",
+                    "fstype": None, "label": None, "uuid": None, "size": 64 * (1024 ** 3),
+                    "mountpoint": None,
+                    "children": [
+                        {
+                            "name": "sda1", "kname": "sda1", "path": "/dev/sda1",
+                            "tran": None, "type": "part", "fstype": "exfat", "label": "WIN_MC",
+                            "uuid": "CAFE-BEEF", "size": 64 * (1024 ** 3), "mountpoint": "/media/mc-usb/CAFE-BEEF",
+                        }
+                    ],
+                },
+                {
+                    "name": "sdb", "kname": "sdb", "path": "/dev/sdb",
+                    "tran": "usb", "rm": True, "hotplug": True, "type": "disk",
+                    "fstype": None, "label": None, "uuid": None, "size": 32 * (1024 ** 3),
+                    "mountpoint": None,
+                    "children": [
+                        {
+                            "name": "sdb1", "kname": "sdb1", "path": "/dev/sdb1",
+                            "tran": None, "type": "part", "fstype": "ext4", "label": "LINUX_USB",
+                            "uuid": "EXT4-9999", "size": 32 * (1024 ** 3), "mountpoint": None,
+                        }
+                    ],
+                },
+            ]
+        }
+        mock_proc = mock.Mock(returncode=0, stdout=json.dumps(lsblk_payload))
+
+        # Act
+        with mock.patch("webui.subprocess.run", return_value=mock_proc):
+            drives = webui.detect_external_usb_drives()
+
+        # Assert
+        self.assertEqual(len(drives), 2)
+        devices = [d["device"] for d in drives]
+        self.assertNotIn("/dev/mmcblk0", devices)
+        self.assertNotIn("/dev/mmcblk0p1", devices)
+        self.assertNotIn("/dev/mmcblk0p2", devices)
+        self.assertEqual(drives[0]["device"], "/dev/sda1")
+        self.assertEqual(drives[0]["id"], "usb:UUID=CAFE-BEEF")
+        self.assertTrue(drives[0]["windows_compatible"])
+        self.assertEqual(drives[0]["size_gb"], 64.0)
+        self.assertEqual(drives[1]["device"], "/dev/sdb1")
+        self.assertFalse(drives[1]["windows_compatible"])
+
+    def test_resolve_backup_storage_usb_active_auto_mount_and_unplugged_fallback(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            default_dir = os.path.join(tmpdir, "default_backups")
+            usb_mp_mounted = os.path.join(tmpdir, "usb_mounted")
+            usb_mp_automount = os.path.join(tmpdir, "usb_automount")
+            os.makedirs(default_dir, exist_ok=True)
+            os.makedirs(usb_mp_mounted, exist_ok=True)
+            os.makedirs(usb_mp_automount, exist_ok=True)
+
+            mounted_drive = {
+                "device": "/dev/sda1", "kname": "sda1", "uuid": "AAA-111", "label": "WINUSB",
+                "fstype": "exfat", "size_gb": 32.0, "mountpoint": usb_mp_mounted,
+                "windows_compatible": True, "id": "usb:UUID=AAA-111",
+                "backup_dir": os.path.join(usb_mp_mounted, "minecraft_backups"),
+            }
+            unmounted_drive = {
+                "device": "/dev/sda1", "kname": "sda1", "uuid": "AAA-111", "label": "WINUSB",
+                "fstype": "vfat", "size_gb": 32.0, "mountpoint": "",
+                "windows_compatible": True, "id": "usb:UUID=AAA-111", "backup_dir": "",
+            }
+            ext4_drive = {
+                "device": "/dev/sdb1", "kname": "sdb1", "uuid": "BBB-222", "label": "EXTUSB",
+                "fstype": "ext4", "size_gb": 16.0, "mountpoint": "",
+                "windows_compatible": False, "id": "usb:UUID=BBB-222", "backup_dir": "",
+            }
+            usb_cfg = {"backup_location": "usb:UUID=AAA-111", "usb_uuid": "AAA-111", "usb_device": "/dev/sda1"}
+
+            with mock.patch.object(webui, "BACKUP_DIR", default_dir):
+                # Act
+                res_default = webui.resolve_backup_storage(backup_cfg={"backup_location": "default"}, drives=[mounted_drive])
+                res_mounted = webui.resolve_backup_storage(backup_cfg=usb_cfg, drives=[mounted_drive])
+                with mock.patch("webui.auto_mount_usb_drive", return_value=(True, usb_mp_automount, "")) as mock_mount:
+                    res_automount = webui.resolve_backup_storage(backup_cfg=usb_cfg, drives=[unmounted_drive])
+                res_incompat = webui.resolve_backup_storage(backup_cfg={"backup_location": "usb:UUID=BBB-222"}, drives=[ext4_drive])
+                res_unplugged = webui.resolve_backup_storage(backup_cfg=usb_cfg, drives=[])
+
+                # Assert
+                self.assertEqual(res_default["status"], "default")
+                self.assertEqual(res_default["active_dir"], default_dir)
+                self.assertFalse(res_default["is_usb_active"])
+
+                self.assertEqual(res_mounted["status"], "usb_active")
+                self.assertTrue(res_mounted["is_usb_active"])
+                self.assertEqual(res_mounted["format_type"], "uncompressed_folder")
+                self.assertEqual(res_mounted["active_dir"], os.path.join(usb_mp_mounted, "minecraft_backups"))
+                self.assertTrue(os.path.isdir(res_mounted["active_dir"]))
+
+                mock_mount.assert_called_once_with("/dev/sda1")
+                self.assertEqual(res_automount["status"], "usb_active")
+                self.assertEqual(res_automount["active_dir"], os.path.join(usb_mp_automount, "minecraft_backups"))
+
+                self.assertEqual(res_incompat["status"], "usb_incompatible_fs")
+                self.assertTrue(res_incompat["is_fallback"])
+                self.assertEqual(res_incompat["active_dir"], default_dir)
+
+                self.assertEqual(res_unplugged["status"], "usb_unplugged_fallback")
+                self.assertTrue(res_unplugged["is_fallback"])
+                self.assertEqual(res_unplugged["active_dir"], default_dir)
+
+    def _start_test_server(self, tmpdir, usb_drives_patch=None):
+        auth_file = os.path.join(tmpdir, "auth.json")
+        addr_file = os.path.join(tmpdir, "address_config.json")
+        update_file = os.path.join(tmpdir, "update_status.json")
+        base_dir = os.path.join(tmpdir, "bedrock")
+        props_file = os.path.join(base_dir, "server.properties")
+        allow_file = os.path.join(base_dir, "allowlist.json")
+        perm_file = os.path.join(base_dir, "permissions.json")
+        bk_cfg_file = os.path.join(tmpdir, "backup_config.json")
+        bk_dir = os.path.join(tmpdir, "backups")
+        os.makedirs(os.path.join(base_dir, "worlds"), exist_ok=True)
+        os.makedirs(bk_dir, exist_ok=True)
+        with open(auth_file, "w", encoding="utf-8") as f:
+            json.dump({"admin_pass": "testpass99"}, f)
+        with open(props_file, "w", encoding="utf-8") as f:
+            f.write("server-name=TestPi\nlevel-name=Bedrock level\nserver-port=19132\n")
+
+        patchers = [
+            mock.patch.object(webui, "AUTH_FILE", auth_file),
+            mock.patch.object(webui, "ADDRESS_CONFIG_FILE", addr_file),
+            mock.patch.object(webui, "UPDATE_STATUS_FILE", update_file),
+            mock.patch.object(webui, "BASE_DIR", base_dir),
+            mock.patch.object(webui, "PROPERTIES_FILE", props_file),
+            mock.patch.object(webui, "ALLOWLIST_FILE", allow_file),
+            mock.patch.object(webui, "PERMISSIONS_FILE", perm_file),
+            mock.patch.object(webui, "BACKUP_CONFIG_FILE", bk_cfg_file),
+            mock.patch.object(webui, "BACKUP_DIR", bk_dir),
+            mock.patch.object(webui, "get_service_status", return_value="ACTIVE (RUNNING)"),
+            mock.patch.object(webui, "get_device_stats", return_value={
+                "uptime": "1d", "cpu_temp": "44.0 °C", "load_avg": "0.10, 0.10, 0.10",
+                "root_used_gb": 5.0, "root_total_gb": 32.0, "root_pct": 15.6, "root_free_gb": 27.0,
+                "worlds_path": os.path.join(base_dir, "worlds"), "is_external_worlds": False,
+                "worlds_used_gb": 1.0, "worlds_total_gb": 32.0, "worlds_pct": 3.1,
+                "ram_used_mb": 512, "ram_total_mb": 4096, "ram_pct": 12.5, "ram_free_mb": 3584,
+                "swap_used_mb": 0, "swap_total_mb": 2048, "swap_pct": 0.0, "swap_free_mb": 2048,
+            }),
+        ]
+        if usb_drives_patch is not None:
+            patchers.append(usb_drives_patch)
+        for p in patchers:
+            p.start()
+        srv = webui.ThreadingWebUIServer(("127.0.0.1", 0), webui.WebUIHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        token = base64.b64encode(b"admin:testpass99").decode("ascii")
+        headers = {"Authorization": f"Basic {token}"}
+        return srv, patchers, headers, base_dir, bk_dir
+
+    def _http_call(self, port, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            resp = conn.getresponse()
+            return resp.status, dict(resp.getheaders()), resp.read()
+        finally:
+            conn.close()
+
+    def test_uncompressed_folder_backups_list_prune_download_restore_and_delete(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usb_mp = os.path.join(tmpdir, "usb_drive")
+            usb_bk_dir = os.path.join(usb_mp, "minecraft_backups")
+            os.makedirs(usb_bk_dir, exist_ok=True)
+            fake_drive = {
+                "device": "/dev/sda1", "kname": "sda1", "uuid": "CAFE-1111", "label": "MYUSB",
+                "fstype": "exfat", "size_gb": 64.0, "mountpoint": usb_mp,
+                "windows_compatible": True, "id": "usb:UUID=CAFE-1111", "backup_dir": usb_bk_dir,
+            }
+            srv, patchers, headers, base_dir, _ = self._start_test_server(
+                tmpdir, usb_drives_patch=mock.patch.object(webui, "detect_external_usb_drives", return_value=[fake_drive])
+            )
+            try:
+                webui.save_backup_config({
+                    **webui.DEFAULT_BACKUP_CONFIG,
+                    "backup_location": "usb:UUID=CAFE-1111",
+                    "usb_device": "/dev/sda1",
+                    "usb_uuid": "CAFE-1111",
+                    "usb_label": "MYUSB",
+                    "usb_mountpoint": usb_mp,
+                })
+                bk_new = os.path.join(usb_bk_dir, "bedrock_backup_20261119_200000")
+                bk_old = os.path.join(usb_bk_dir, "bedrock_backup_20261110_100000")
+                os.makedirs(os.path.join(bk_new, "worlds", "Bedrock level"), exist_ok=True)
+                with open(os.path.join(bk_new, "worlds", "Bedrock level", "level.dat"), "wb") as f:
+                    f.write(b"LEVELDATA123")
+                with open(os.path.join(bk_new, "server.properties"), "w", encoding="utf-8") as f:
+                    f.write("server-name=RestoredPi\nlevel-name=Bedrock level\n")
+                os.makedirs(os.path.join(bk_old, "worlds", "Bedrock level"), exist_ok=True)
+                with open(os.path.join(bk_old, "worlds", "Bedrock level", "level.dat"), "wb") as f:
+                    f.write(b"OLD")
+                old_ts = time.time() - (15 * 86400)
+                os.utime(bk_old, (old_ts, old_ts))
+
+                # Act: list, prune, download zip, restore, delete
+                listed_before = webui.list_backups(backup_dir=usb_bk_dir)
+                webui.prune_backups(retention_days=7, max_backups=10, backup_dir=usb_bk_dir)
+                listed_after_prune = webui.list_backups(backup_dir=usb_bk_dir)
+
+                dl_status, dl_hdrs, dl_bytes = self._http_call(
+                    srv.server_address[1], "GET", "/backup/download?file=bedrock_backup_20261119_200000", headers=headers
+                )
+                post_hdrs = {**headers, "Content-Type": "application/x-www-form-urlencoded"}
+                with mock.patch("webui.execute_action") as mock_act, \
+                     mock.patch("webui.subprocess.run") as mock_sub:
+                    rest_status, _, _ = self._http_call(
+                        srv.server_address[1], "POST", "/backup/restore",
+                        body="filename=bedrock_backup_20261119_200000", headers=post_hdrs
+                    )
+                del_status, _, _ = self._http_call(
+                    srv.server_address[1], "POST", "/backup/delete",
+                    body="filename=bedrock_backup_20261119_200000", headers=post_hdrs
+                )
+                restored_level = os.path.join(base_dir, "worlds", "Bedrock level", "level.dat")
+                restored_props = os.path.join(base_dir, "server.properties")
+
+                # Assert
+                self.assertEqual(len(listed_before), 2)
+                self.assertTrue(listed_before[0]["is_dir"])
+                self.assertEqual([b["filename"] for b in listed_after_prune], ["bedrock_backup_20261119_200000"])
+                self.assertFalse(os.path.exists(bk_old))
+
+                self.assertEqual(dl_status, 200)
+                self.assertIn("bedrock_backup_20261119_200000.zip", dl_hdrs.get("Content-Disposition", ""))
+                with zipfile.ZipFile(io.BytesIO(dl_bytes), "r") as zf:
+                    names = [n.replace("\\", "/") for n in zf.namelist()]
+                    self.assertIn("worlds/Bedrock level/level.dat", names)
+                    self.assertEqual(zf.read("worlds/Bedrock level/level.dat"), b"LEVELDATA123")
+
+                self.assertEqual(rest_status, 303)
+                mock_act.assert_any_call("backup")
+                mock_act.assert_any_call("stop")
+                mock_act.assert_any_call("start")
+                self.assertTrue(mock_sub.called)
+                self.assertTrue(os.path.isfile(restored_level))
+                with open(restored_level, "rb") as f:
+                    self.assertEqual(f.read(), b"LEVELDATA123")
+                with open(restored_props, "r", encoding="utf-8") as f:
+                    self.assertIn("server-name=RestoredPi", f.read())
+
+                self.assertEqual(del_status, 303)
+                self.assertFalse(os.path.exists(bk_new))
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                for p in reversed(patchers):
+                    p.stop()
+
+    def test_webui_backup_location_dropdown_and_format_usb_post(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usb_mp = os.path.join(tmpdir, "usb_exfat")
+            os.makedirs(usb_mp, exist_ok=True)
+            drive_exfat = {
+                "device": "/dev/sda1", "kname": "sda1", "uuid": "WIN-001", "label": "MC_DRIVE",
+                "fstype": "exfat", "size_gb": 128.0, "mountpoint": usb_mp,
+                "windows_compatible": True, "id": "usb:UUID=WIN-001",
+                "backup_dir": os.path.join(usb_mp, "minecraft_backups"),
+            }
+            drive_ext4 = {
+                "device": "/dev/sdb1", "kname": "sdb1", "uuid": "EXT-002", "label": "OLD_EXT4",
+                "fstype": "ext4", "size_gb": 32.0, "mountpoint": "",
+                "windows_compatible": False, "id": "usb:UUID=EXT-002", "backup_dir": "",
+            }
+            srv, patchers, headers, _, _ = self._start_test_server(
+                tmpdir,
+                usb_drives_patch=mock.patch.object(
+                    webui, "detect_external_usb_drives", return_value=[drive_exfat, drive_ext4]
+                ),
+            )
+            try:
+                post_hdrs = {**headers, "Content-Type": "application/x-www-form-urlencoded"}
+
+                # Act
+                s_get, _, body_bytes = self._http_call(srv.server_address[1], "GET", "/", headers=headers)
+                s_set, h_set, _ = self._http_call(
+                    srv.server_address[1],
+                    "POST",
+                    "/backup/settings",
+                    body="auto_backup_enabled=true&interval_hours=6&retention_days=7&max_backups=20&backup_location=usb%3AUUID%3DWIN-001",
+                    headers=post_hdrs,
+                )
+                saved_cfg = webui.read_backup_config()
+
+                s_bad_fmt, h_bad_fmt, _ = self._http_call(
+                    srv.server_address[1],
+                    "POST",
+                    "/backup/format_usb",
+                    body="usb_device=%2Fdev%2Fmmcblk0p2",
+                    headers=post_hdrs,
+                )
+                with mock.patch("webui.format_usb_drive_exfat", return_value=(True, usb_mp, "")) as mock_fmt:
+                    s_fmt, h_fmt, _ = self._http_call(
+                        srv.server_address[1],
+                        "POST",
+                        "/backup/format_usb",
+                        body="usb_device=%2Fdev%2Fsdb1",
+                        headers=post_hdrs,
+                    )
+
+                # Assert
+                self.assertEqual(s_get, 200)
+                page = body_bytes.decode("utf-8")
+                self.assertIn('name="backup_location"', page)
+                self.assertIn("Default Internal Storage", page)
+                self.assertIn("External USB: MC_DRIVE (/dev/sda1", page)
+                self.assertIn("Windows PC Ready - Uncompressed World Files", page)
+                self.assertIn("Requires exFAT Format for Windows", page)
+                self.assertIn('action="/backup/format_usb"', page)
+
+                self.assertEqual(s_set, 303)
+                self.assertEqual(h_set.get("Location"), "/?backup_msg=usb_mounted")
+                self.assertEqual(saved_cfg["backup_location"], "usb:UUID=WIN-001")
+                self.assertEqual(saved_cfg["usb_mountpoint"], usb_mp)
+
+                self.assertEqual(s_bad_fmt, 303)
+                self.assertEqual(h_bad_fmt.get("Location"), "/?backup_err=usb_invalid_device")
+
+                mock_fmt.assert_called_once_with("/dev/sdb1")
+                self.assertEqual(s_fmt, 303)
+                self.assertEqual(h_fmt.get("Location"), "/?backup_msg=usb_formatted")
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                for p in reversed(patchers):
+                    p.stop()
 
 
 if __name__ == "__main__":

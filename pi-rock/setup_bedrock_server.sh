@@ -132,7 +132,8 @@ install_system_dependencies() {
         libssl3 \
         libcurl4 \
         ufw \
-        git
+        git \
+        exfatprogs
 }
 
 install_box64() {
@@ -345,7 +346,7 @@ EOF
 install_helper_scripts() {
     log_info "Installing administrative management tools..."
 
-    # 1. mc-backup tool (automated scheduling, dual retention pruning, and external storage support)
+    # 1. mc-backup tool (automated scheduling, dual retention pruning, and external USB storage support)
     cat > /usr/local/bin/mc-backup << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -353,6 +354,7 @@ set -euo pipefail
 BACKUP_ROOT="/opt/minecraft/backups"
 SOURCE_DIR="/opt/minecraft/bedrock"
 CONFIG_FILE="/opt/minecraft/backup_config.json"
+USB_STORAGE_BIN="/usr/local/bin/mc-usb-storage"
 MODE="${1:-manual}"
 
 # Initialize backup configuration if absent
@@ -364,20 +366,146 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
   "interval_hours": 6,
   "retention_days": 7,
   "max_backups": 20,
-  "last_backup_timestamp": 0
+  "last_backup_timestamp": 0,
+  "backup_location": "default",
+  "usb_device": "",
+  "usb_uuid": "",
+  "usb_label": "",
+  "usb_mountpoint": ""
 }
 JSONEOF
     chown mcserver:mcserver "${CONFIG_FILE}" 2>/dev/null || true
     chmod 664 "${CONFIG_FILE}"
 fi
 
-# Function to execute dual retention pruning (days threshold + max backup count)
-prune_archives() {
+# Resolve active backup target (default internal archive vs mounted Windows-compatible USB folder)
+resolve_target_storage() {
     python3 -c "
-import os, time, json, re
+import json, os, re, subprocess, sys
 
 config_file = '${CONFIG_FILE}'
-backup_dir = '${BACKUP_ROOT}'
+default_root = '${BACKUP_ROOT}'
+usb_bin = '${USB_STORAGE_BIN}'
+win_fs = {'exfat', 'vfat', 'fat32', 'msdos', 'ntfs', 'ntfs3'}
+sys_mounts = {'/', '/boot', '/boot/firmware', '[SWAP]'}
+dev_re = re.compile(r'^/dev/(?:sd[a-z][0-9]*|nvme[0-9]+n[0-9]+p[0-9]+|vd[a-z][0-9]*)$')
+
+cfg = {}
+if os.path.exists(config_file):
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+
+loc = str(cfg.get('backup_location') or 'default').strip() or 'default'
+if loc == 'default':
+    print(f'default\t{default_root}')
+    sys.exit(0)
+
+try:
+    res = subprocess.run(
+        ['lsblk', '-J', '-b', '-o', 'NAME,KNAME,PATH,TRAN,TYPE,FSTYPE,UUID,MOUNTPOINT,PKNAME'],
+        capture_output=True, text=True, timeout=5
+    )
+    data = json.loads(res.stdout or '{}') if res.returncode == 0 else {}
+except Exception:
+    data = {}
+
+drives = []
+for root_dev in (data.get('blockdevices') or [])[:64]:
+    if not isinstance(root_dev, dict):
+        continue
+    root_name = str(root_dev.get('kname') or root_dev.get('name') or '').strip()
+    root_tran = str(root_dev.get('tran') or '').strip().lower()
+    stack = [root_dev]
+    nodes = []
+    is_sys = False
+    visited = 0
+    while stack and visited < 64:
+        visited += 1
+        nd = stack.pop(0)
+        if not isinstance(nd, dict):
+            continue
+        mp = str(nd.get('mountpoint') or '').strip()
+        if mp in sys_mounts:
+            is_sys = True
+        ch = nd.get('children') or []
+        nodes.append((nd, bool(ch)))
+        for c in ch[:32]:
+            stack.append(c)
+    if is_sys:
+        continue
+    for nd, has_ch in nodes:
+        dt = str(nd.get('type') or '').strip().lower()
+        if dt != 'part' and not (dt == 'disk' and not has_ch):
+            continue
+        kn = str(nd.get('kname') or nd.get('name') or '').strip()
+        p = str(nd.get('path') or (f'/dev/{kn}' if kn else '')).strip()
+        if not dev_re.match(p):
+            continue
+        tr = str(nd.get('tran') or root_tran or '').strip().lower()
+        mp = str(nd.get('mountpoint') or '').strip()
+        if tr != 'usb' and not mp.startswith(('/media/', '/mnt/', '/run/media/')):
+            continue
+        uuid = str(nd.get('uuid') or '').strip()
+        drives.append({
+            'id': f'usb:UUID={uuid}' if uuid else f'usb:DEV={p}',
+            'device': p,
+            'uuid': uuid,
+            'fstype': str(nd.get('fstype') or '').strip().lower(),
+            'mountpoint': mp,
+        })
+
+matched = next((d for d in drives if d['id'] == loc), None)
+if matched is None and cfg.get('usb_uuid'):
+    matched = next((d for d in drives if d['uuid'] == cfg['usb_uuid']), None)
+if matched is None and cfg.get('usb_device'):
+    matched = next((d for d in drives if d['device'] == cfg['usb_device']), None)
+
+if matched is None:
+    print(f'[WARN] Selected external USB drive ({loc}) is unplugged; falling back to {default_root}.', file=sys.stderr)
+    print(f'default\t{default_root}')
+    sys.exit(0)
+
+if matched['fstype'] not in win_fs:
+    print(f'[WARN] External USB drive {matched[\"device\"]} filesystem ({matched[\"fstype\"]}) is not Windows-compatible; falling back to {default_root}.', file=sys.stderr)
+    print(f'default\t{default_root}')
+    sys.exit(0)
+
+mp = matched['mountpoint']
+if not mp and os.path.exists(usb_bin):
+    try:
+        mres = subprocess.run([usb_bin, 'mount', matched['device']], capture_output=True, text=True, timeout=20)
+        if mres.returncode == 0:
+            lines = [ln.strip() for ln in (mres.stdout or '').splitlines() if ln.strip()]
+            mp = lines[-1] if lines else ''
+    except Exception:
+        mp = ''
+
+if not mp:
+    print(f'[WARN] Could not mount external USB drive {matched[\"device\"]}; falling back to {default_root}.', file=sys.stderr)
+    print(f'default\t{default_root}')
+    sys.exit(0)
+
+target_dir = os.path.join(mp, 'minecraft_backups')
+try:
+    os.makedirs(target_dir, exist_ok=True)
+    print(f'usb\t{target_dir}')
+except OSError:
+    print(f'[WARN] External USB backup path {target_dir} is not writable; falling back to {default_root}.', file=sys.stderr)
+    print(f'default\t{default_root}')
+"
+}
+
+# Function to execute dual retention pruning (days threshold + max backup count)
+prune_archives() {
+    local target_dir="${1:-${BACKUP_ROOT}}"
+    python3 -c "
+import os, time, json, re, shutil, sys
+
+config_file = '${CONFIG_FILE}'
+backup_dir = sys.argv[1]
 
 retention_days = 7
 max_backups = 20
@@ -396,37 +524,49 @@ if not os.path.exists(backup_dir):
 
 now = time.time()
 cutoff = retention_days * 86400
-pattern = re.compile(r'^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$')
+pattern = re.compile(r'^bedrock_backup_[a-zA-Z0-9_.-]+(?:\.(?:tar\.gz|zip))?$')
 
-archives = []
-for fname in os.listdir(backup_dir):
-    if pattern.match(fname):
+entries = []
+for fname in os.listdir(backup_dir)[:2048]:
+    if '..' not in fname and pattern.match(fname):
         fpath = os.path.join(backup_dir, fname)
-        if os.path.isfile(fpath):
+        if os.path.isfile(fpath) or os.path.isdir(fpath):
             try:
                 mtime = os.path.getmtime(fpath)
                 if (now - mtime) > cutoff:
-                    os.remove(fpath)
+                    if os.path.isdir(fpath) and not os.path.islink(fpath):
+                        shutil.rmtree(fpath)
+                    else:
+                        os.remove(fpath)
                     print(f'[INFO] Pruned expired backup: {fname}')
                 else:
-                    archives.append((fpath, mtime, fname))
+                    entries.append((fpath, mtime, fname))
             except Exception:
                 pass
 
-archives.sort(key=lambda x: x[1], reverse=True)
-if len(archives) > max_backups:
-    for fpath, _, fname in archives[max_backups:]:
+entries.sort(key=lambda x: x[1], reverse=True)
+if len(entries) > max_backups:
+    for fpath, _, fname in entries[max_backups:]:
         try:
-            os.remove(fpath)
+            if os.path.isdir(fpath) and not os.path.islink(fpath):
+                shutil.rmtree(fpath)
+            else:
+                os.remove(fpath)
             print(f'[INFO] Pruned excess backup beyond max limit ({max_backups}): {fname}')
         except Exception:
             pass
-"
+if hasattr(os, 'sync'):
+    os.sync()
+" "${target_dir}"
 }
 
+STORAGE_INFO="$(resolve_target_storage)"
+TARGET_MODE="${STORAGE_INFO%%$'\t'*}"
+TARGET_BACKUP_ROOT="${STORAGE_INFO#*$'\t'}"
+
 if [[ "${MODE}" == "--prune" ]]; then
-    echo "[INFO] Executing backup retention pruning..."
-    prune_archives
+    echo "[INFO] Executing backup retention pruning in ${TARGET_BACKUP_ROOT}..."
+    prune_archives "${TARGET_BACKUP_ROOT}"
     exit 0
 fi
 
@@ -463,23 +603,39 @@ except Exception:
     fi
 fi
 
-mkdir -p "${BACKUP_ROOT}"
+mkdir -p "${TARGET_BACKUP_ROOT}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-ARCHIVE_FILE="${BACKUP_ROOT}/bedrock_backup_${TIMESTAMP}.tar.gz"
 
-echo "[INFO] Creating Minecraft Bedrock server backup: ${ARCHIVE_FILE}..."
-
-# Create compressed archive following symlinks (-h) for external storage
-tar -czhf "${ARCHIVE_FILE}" \
-    -C "${SOURCE_DIR}" \
-    worlds \
-    server.properties \
-    allowlist.json \
-    permissions.json 2>/dev/null || \
-tar -czhf "${ARCHIVE_FILE}" \
-    -C "${SOURCE_DIR}" \
-    worlds \
-    server.properties
+if [[ "${TARGET_MODE}" == "usb" ]]; then
+    DEST_FOLDER="${TARGET_BACKUP_ROOT}/bedrock_backup_${TIMESTAMP}"
+    echo "[INFO] Creating uncompressed Windows-compatible world backup: ${DEST_FOLDER}..."
+    mkdir -p "${DEST_FOLDER}/worlds"
+    if [[ -d "${SOURCE_DIR}/worlds" ]] && find "${SOURCE_DIR}/worlds" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        cp -rL "${SOURCE_DIR}/worlds/." "${DEST_FOLDER}/worlds/"
+    fi
+    for cfg_item in server.properties allowlist.json permissions.json; do
+        if [[ -f "${SOURCE_DIR}/${cfg_item}" ]]; then
+            cp -f "${SOURCE_DIR}/${cfg_item}" "${DEST_FOLDER}/${cfg_item}"
+        fi
+    done
+    sync
+    BACKUP_ARTIFACT="${DEST_FOLDER}"
+else
+    ARCHIVE_FILE="${TARGET_BACKUP_ROOT}/bedrock_backup_${TIMESTAMP}.tar.gz"
+    echo "[INFO] Creating Minecraft Bedrock server backup: ${ARCHIVE_FILE}..."
+    # Create compressed archive following symlinks (-h) for external storage
+    tar -czhf "${ARCHIVE_FILE}" \
+        -C "${SOURCE_DIR}" \
+        worlds \
+        server.properties \
+        allowlist.json \
+        permissions.json 2>/dev/null || \
+    tar -czhf "${ARCHIVE_FILE}" \
+        -C "${SOURCE_DIR}" \
+        worlds \
+        server.properties
+    BACKUP_ARTIFACT="${ARCHIVE_FILE}"
+fi
 
 # Update last_backup_timestamp in configuration
 python3 -c "
@@ -499,13 +655,15 @@ if os.path.exists(config_file):
         pass
 "
 
-# Set ownership
-chown -R mcserver:mcserver "${BACKUP_ROOT}" "${CONFIG_FILE}" 2>/dev/null || true
+# Set ownership safely (FAT/exFAT ignores chown via || true)
+chown -R mcserver:mcserver "${TARGET_BACKUP_ROOT}" "${CONFIG_FILE}" 2>/dev/null || true
+chmod 664 "${CONFIG_FILE}" 2>/dev/null || true
 
 # Execute dual retention pruning
-prune_archives
+prune_archives "${TARGET_BACKUP_ROOT}"
+sync
 
-echo "[INFO] Backup completed successfully: ${ARCHIVE_FILE}"
+echo "[INFO] Backup completed successfully: ${BACKUP_ARTIFACT}"
 EOF
     chmod 755 /usr/local/bin/mc-backup
 
@@ -524,12 +682,196 @@ EOF
   "interval_hours": 6,
   "retention_days": 7,
   "max_backups": 20,
-  "last_backup_timestamp": 0
+  "last_backup_timestamp": 0,
+  "backup_location": "default",
+  "usb_device": "",
+  "usb_uuid": "",
+  "usb_label": "",
+  "usb_mountpoint": ""
 }
 EOF
         chown mcserver:mcserver /opt/minecraft/backup_config.json
         chmod 664 /opt/minecraft/backup_config.json
     fi
+
+    # 1b. mc-usb-storage tool (safe mounting and exFAT formatting for Windows-compatible USB backup drives)
+    cat > /usr/local/bin/mc-usb-storage << 'USBEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "[ERROR] This tool must run as root." >&2
+    exit 1
+fi
+
+ACTION="${1:-}"
+DEVICE="${2:-}"
+LABEL="${3:-MC_BACKUPS}"
+
+validate_usb_device() {
+    local dev="$1"
+    python3 -c "
+import json, re, subprocess, sys
+
+dev = sys.argv[1]
+if not re.match(r'^/dev/(?:sd[a-z][0-9]*|nvme[0-9]+n[0-9]+p[0-9]+|vd[a-z][0-9]*)$', dev):
+    print('[ERROR] Invalid device path.', file=sys.stderr)
+    sys.exit(1)
+
+res = subprocess.run(
+    ['lsblk', '-J', '-b', '-o', 'NAME,KNAME,PATH,TRAN,TYPE,FSTYPE,UUID,MOUNTPOINT,PKNAME'],
+    capture_output=True, text=True, timeout=5
+)
+if res.returncode != 0:
+    print('[ERROR] lsblk failed.', file=sys.stderr)
+    sys.exit(1)
+
+data = json.loads(res.stdout or '{}')
+sys_mounts = {'/', '/boot', '/boot/firmware', '[SWAP]'}
+
+for root_dev in (data.get('blockdevices') or [])[:64]:
+    if not isinstance(root_dev, dict):
+        continue
+    root_tran = str(root_dev.get('tran') or '').strip().lower()
+    stack = [root_dev]
+    nodes = []
+    is_sys = False
+    visited = 0
+    while stack and visited < 64:
+        visited += 1
+        nd = stack.pop(0)
+        if not isinstance(nd, dict):
+            continue
+        mp = str(nd.get('mountpoint') or '').strip()
+        if mp in sys_mounts:
+            is_sys = True
+        ch = nd.get('children') or []
+        nodes.append((nd, bool(ch)))
+        for c in ch[:32]:
+            stack.append(c)
+
+    for nd, has_ch in nodes:
+        kn = str(nd.get('kname') or nd.get('name') or '').strip()
+        p = str(nd.get('path') or (f'/dev/{kn}' if kn else '')).strip()
+        if p != dev:
+            continue
+        if is_sys:
+            print('[ERROR] Refusing operation on system boot/root disk.', file=sys.stderr)
+            sys.exit(1)
+        dt = str(nd.get('type') or '').strip().lower()
+        if dt != 'part' and not (dt == 'disk' and not has_ch):
+            print('[ERROR] Target must be a partition or unpartitioned disk.', file=sys.stderr)
+            sys.exit(1)
+        tr = str(nd.get('tran') or root_tran or '').strip().lower()
+        mp = str(nd.get('mountpoint') or '').strip()
+        if tr != 'usb' and not mp.startswith(('/media/', '/mnt/', '/run/media/')):
+            print('[ERROR] Target is not an external USB storage device.', file=sys.stderr)
+            sys.exit(1)
+        fstype = str(nd.get('fstype') or '').strip().lower()
+        uuid = str(nd.get('uuid') or '').strip()
+        print(f'{fstype}\t{uuid}\t{kn}\t{mp}')
+        sys.exit(0)
+
+print('[ERROR] External USB device not found.', file=sys.stderr)
+sys.exit(1)
+" "${dev}"
+}
+
+mount_validated_device() {
+    local dev="$1"
+    local fstype="$2"
+    local uuid="$3"
+    local kname="$4"
+    local safe_id
+    safe_id="$(printf '%s' "${uuid:-${kname}}" | tr -cd 'A-Za-z0-9_-')"
+    if [[ -z "${safe_id}" ]]; then
+        safe_id="$(basename "${dev}")"
+    fi
+    local target_mp="/media/mc-usb/${safe_id}"
+    mkdir -p "${target_mp}"
+    local mc_uid mc_gid
+    mc_uid="$(id -u mcserver)"
+    mc_gid="$(id -g mcserver)"
+
+    local mount_fs="${fstype}"
+    if [[ "${mount_fs}" == "fat32" ]]; then
+        mount_fs="vfat"
+    fi
+
+    if [[ "${mount_fs}" == "ntfs" ]]; then
+        mount -t ntfs3 -o "uid=${mc_uid},gid=${mc_gid},umask=0007" "${dev}" "${target_mp}" >&2 || \
+        mount -t ntfs -o "uid=${mc_uid},gid=${mc_gid},umask=0007" "${dev}" "${target_mp}" >&2
+    else
+        mount -t "${mount_fs}" -o "uid=${mc_uid},gid=${mc_gid},umask=0007" "${dev}" "${target_mp}" >&2
+    fi
+
+    mkdir -p "${target_mp}/minecraft_backups"
+    sync
+    printf '%s\n' "${target_mp}"
+}
+
+case "${ACTION}" in
+    mount)
+        if [[ -z "${DEVICE}" || ! -b "${DEVICE}" ]]; then
+            echo "[ERROR] Missing or invalid block device." >&2
+            exit 1
+        fi
+        DEV_INFO="$(validate_usb_device "${DEVICE}")"
+        IFS=$'\t' read -r FSTYPE UUID KNAME CUR_MP <<< "${DEV_INFO}"
+        case "${FSTYPE}" in
+            exfat|vfat|fat32|msdos|ntfs|ntfs3)
+                ;;
+            *)
+                echo "[ERROR] Filesystem '${FSTYPE:-unformatted}' is not Windows-compatible (requires exFAT, FAT32, or NTFS)." >&2
+                exit 3
+                ;;
+        esac
+        if [[ -n "${CUR_MP}" ]]; then
+            if su -s /bin/sh mcserver -c 'test -w "$1"' _ "${CUR_MP}" 2>/dev/null; then
+                mkdir -p "${CUR_MP}/minecraft_backups"
+                sync
+                printf '%s\n' "${CUR_MP}"
+                exit 0
+            fi
+            sync
+            umount "${DEVICE}" >&2
+        fi
+        mount_validated_device "${DEVICE}" "${FSTYPE}" "${UUID}" "${KNAME}"
+        ;;
+    format-exfat)
+        if [[ -z "${DEVICE}" || ! -b "${DEVICE}" ]]; then
+            echo "[ERROR] Missing or invalid block device." >&2
+            exit 1
+        fi
+        if [[ ! "${LABEL}" =~ ^[A-Za-z0-9_-]{1,11}$ ]]; then
+            echo "[ERROR] Invalid exFAT volume label." >&2
+            exit 1
+        fi
+        if ! command -v mkfs.exfat >/dev/null 2>&1; then
+            echo "[ERROR] mkfs.exfat is not installed. Run: sudo apt-get install -y exfatprogs" >&2
+            exit 1
+        fi
+        DEV_INFO="$(validate_usb_device "${DEVICE}")"
+        IFS=$'\t' read -r _ _ KNAME CUR_MP <<< "${DEV_INFO}"
+        if [[ -n "${CUR_MP}" ]] || mountpoint -q "${CUR_MP:-/nonexistent}" 2>/dev/null; then
+            sync
+            umount "${DEVICE}" >&2 || true
+        fi
+        mkfs.exfat -n "${LABEL}" "${DEVICE}" >&2
+        udevadm settle 2>/dev/null || true
+        NEW_UUID="$(lsblk -no UUID "${DEVICE}" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+        mount_validated_device "${DEVICE}" "exfat" "${NEW_UUID}" "${KNAME}"
+        ;;
+    sync)
+        sync
+        ;;
+    *)
+        echo "Usage: sudo mc-usb-storage <mount|format-exfat|sync> [DEVICE] [LABEL]" >&2
+        exit 1
+        ;;
+esac
+USBEOF
+    chmod 755 /usr/local/bin/mc-usb-storage
 
     # 2. mc-update tool (preserves external storage symlinks and configs)
     cat > /usr/local/bin/mc-update << 'EOF'
@@ -1275,7 +1617,7 @@ REINSTALLEOF
     chmod 755 /usr/local/bin/mc-reinstall.tmp
     mv -f /usr/local/bin/mc-reinstall.tmp /usr/local/bin/mc-reinstall
 
-    log_info "Administrative tools installed: /usr/local/bin/mc-backup, /usr/local/bin/mc-update, /usr/local/bin/mc-set-storage, /usr/local/bin/mc-allowlist, /usr/local/bin/mc-permission, /usr/local/bin/mc-reinstall"
+    log_info "Administrative tools installed: /usr/local/bin/mc-backup, /usr/local/bin/mc-usb-storage, /usr/local/bin/mc-update, /usr/local/bin/mc-set-storage, /usr/local/bin/mc-allowlist, /usr/local/bin/mc-permission, /usr/local/bin/mc-reinstall"
 }
 
 # ------------------------------------------------------------------------------
@@ -1452,12 +1794,33 @@ VALID_PROPERTIES = {
     "texturepack-required": ["true", "false"],
 }
 
+USB_STORAGE_BIN = "/usr/local/bin/mc-usb-storage"
+WINDOWS_COMPATIBLE_FSTYPES = ("exfat", "vfat", "fat32", "msdos", "ntfs", "ntfs3")
+BACKUP_NAME_RE = re.compile(r"^bedrock_backup_[a-zA-Z0-9_.-]+(?:\.(?:tar\.gz|zip))?$")
+USB_DEV_PATH_RE = re.compile(r"^/dev/(?:sd[a-z][0-9]*|nvme[0-9]+n[0-9]+p[0-9]+|vd[a-z][0-9]*)$")
+
 DEFAULT_BACKUP_CONFIG = {
     "auto_backup_enabled": True,
     "interval_hours": 6,
     "retention_days": 7,
     "max_backups": 20,
     "last_backup_timestamp": 0,
+    "backup_location": "default",
+    "usb_device": "",
+    "usb_uuid": "",
+    "usb_label": "",
+    "usb_mountpoint": "",
+}
+
+BACKUP_FLASH_MESSAGES = {
+    "settings_saved": ("success", "Backup schedule, retention policy, and save location updated."),
+    "usb_mounted": ("success", "External USB drive mounted and configured for uncompressed Windows-compatible world backups."),
+    "usb_unplugged_saved": ("info", "External USB preference saved. Backups will use Default Internal Storage while the USB drive is unplugged."),
+    "usb_incompatible_fs": ("error", "Selected USB drive is not formatted for Windows (requires exFAT, FAT32, or NTFS). Format the drive to exFAT below."),
+    "usb_mount_failed": ("error", "Failed to mount the selected external USB drive. Verify the drive is connected or format it to exFAT."),
+    "usb_formatted": ("success", "External USB drive formatted to exFAT, mounted, and selected for Windows-compatible uncompressed world backups."),
+    "usb_format_failed": ("error", "Failed to format the external USB drive to exFAT. Check system logs and verify the drive is writable."),
+    "usb_invalid_device": ("error", "Invalid or non-removable USB storage device specified."),
 }
 
 VALID_PERMISSIONS = ["visitor", "member", "operator", "default"]
@@ -1642,55 +2005,396 @@ def save_backup_config(config):
     os.replace(tmp_file, BACKUP_CONFIG_FILE)
 
 
-def prune_backups(retention_days=7, max_backups=20):
-    if not os.path.exists(BACKUP_DIR):
+def _is_valid_backup_name(name):
+    """Return True only for allow-listed backup file or folder names."""
+    return bool(isinstance(name, str) and ".." not in name and BACKUP_NAME_RE.match(name))
+
+
+def _resolve_safe_backup_path(base_dir, name):
+    """Resolve backup entry path strictly inside base_dir, blocking traversal."""
+    if not _is_valid_backup_name(name):
+        return None
+    base_abs = os.path.abspath(base_dir)
+    target_abs = os.path.abspath(os.path.join(base_abs, name))
+    if os.path.dirname(target_abs) != base_abs:
+        return None
+    return target_abs
+
+
+def _flush_filesystem_buffers():
+    """Flush kernel filesystem buffers so external drives are safe after writes."""
+    sync_fn = getattr(os, "sync", None)
+    if callable(sync_fn):
+        try:
+            sync_fn()
+        except OSError:
+            pass
+
+
+def _get_entry_size_bytes(fpath):
+    """Return total byte size of a backup file or uncompressed world directory."""
+    if os.path.isfile(fpath):
+        return os.path.getsize(fpath)
+    if not os.path.isdir(fpath):
+        return 0
+    total = 0
+    dir_count = 0
+    for root, _, files in os.walk(fpath, followlinks=False):
+        dir_count += 1
+        if dir_count > 4096:
+            break
+        for fname in files[:4096]:
+            item = os.path.join(root, fname)
+            try:
+                if os.path.isfile(item) and not os.path.islink(item):
+                    total += os.path.getsize(item)
+            except OSError:
+                pass
+    return total
+
+
+def _remove_backup_entry(fpath):
+    """Remove a backup archive file or uncompressed backup directory."""
+    if os.path.isdir(fpath) and not os.path.islink(fpath):
+        shutil.rmtree(fpath)
+    elif os.path.exists(fpath) or os.path.islink(fpath):
+        os.remove(fpath)
+
+
+def _node_has_system_mount(node):
+    """Return True if a block device node hosts a core OS or swap mountpoint."""
+    sys_mounts = {"/", "/boot", "/boot/firmware", "[SWAP]"}
+    mp = str(node.get("mountpoint") or "").strip()
+    if mp in sys_mounts:
+        return True
+    mps = node.get("mountpoints")
+    if isinstance(mps, list):
+        for item in mps[:16]:
+            if str(item or "").strip() in sys_mounts:
+                return True
+    return False
+
+
+def _flatten_lsblk_tree(blockdevices):
+    """Flatten nested lsblk tree iteratively without recursion and flag system disks."""
+    flattened = []
+    system_roots = set()
+    for root_dev in (blockdevices or [])[:64]:
+        if not isinstance(root_dev, dict):
+            continue
+        root_name = str(root_dev.get("kname") or root_dev.get("name") or "").strip()
+        root_tran = str(root_dev.get("tran") or "").strip().lower()
+        root_rm = bool(root_dev.get("rm"))
+        root_hotplug = bool(root_dev.get("hotplug"))
+
+        stack = [root_dev]
+        visited = 0
+        while stack and visited < 64:
+            visited += 1
+            node = stack.pop(0)
+            if not isinstance(node, dict):
+                continue
+            children = node.get("children") or []
+            if _node_has_system_mount(node):
+                system_roots.add(root_name)
+            flattened.append({
+                "node": node,
+                "root_name": root_name,
+                "root_tran": root_tran,
+                "root_rm": root_rm,
+                "root_hotplug": root_hotplug,
+                "has_children": bool(children),
+            })
+            for child in children[:32]:
+                stack.append(child)
+    return flattened, system_roots
+
+
+def detect_external_usb_drives():
+    """Discover connected non-system external USB storage partitions or disks via lsblk."""
+    try:
+        res = subprocess.run(
+            [
+                "lsblk", "-J", "-b", "-o",
+                "NAME,KNAME,PATH,TRAN,RM,HOTPLUG,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINT,PKNAME",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode != 0:
+            return []
+        payload = json.loads(res.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+    flattened, system_roots = _flatten_lsblk_tree(payload.get("blockdevices", []))
+    drives = []
+    for item in flattened[:256]:
+        if item["root_name"] in system_roots:
+            continue
+        node = item["node"]
+        dev_type = str(node.get("type") or "").strip().lower()
+        if dev_type != "part" and not (dev_type == "disk" and not item["has_children"]):
+            continue
+
+        kname = str(node.get("kname") or node.get("name") or "").strip()
+        path = str(node.get("path") or (f"/dev/{kname}" if kname else "")).strip()
+        if not USB_DEV_PATH_RE.match(path):
+            continue
+
+        tran = str(node.get("tran") or item["root_tran"] or "").strip().lower()
+        mp = str(node.get("mountpoint") or "").strip()
+        is_ext = (tran == "usb") or mp.startswith(("/media/", "/mnt/", "/run/media/"))
+        if not is_ext:
+            continue
+
+        fstype = str(node.get("fstype") or "").strip().lower()
+        uuid = str(node.get("uuid") or "").strip()
+        label = str(node.get("label") or "").strip() or kname or os.path.basename(path)
+        try:
+            size_bytes = int(node.get("size") or 0)
+        except (TypeError, ValueError):
+            size_bytes = 0
+        win_compat = fstype in WINDOWS_COMPATIBLE_FSTYPES
+        drive_id = f"usb:UUID={uuid}" if uuid else f"usb:DEV={path}"
+        drives.append({
+            "device": path,
+            "kname": kname,
+            "uuid": uuid,
+            "label": label,
+            "fstype": fstype,
+            "size_gb": round(size_bytes / (1024 ** 3), 1),
+            "mountpoint": mp,
+            "windows_compatible": win_compat,
+            "id": drive_id,
+            "backup_dir": os.path.join(mp, "minecraft_backups") if mp else "",
+        })
+    return drives
+
+
+def auto_mount_usb_drive(device_path):
+    """Mount a validated Windows-compatible USB device using the privileged helper."""
+    dev = str(device_path or "").strip()
+    if not USB_DEV_PATH_RE.match(dev):
+        return False, "", "usb_invalid_device"
+    if not os.path.exists(USB_STORAGE_BIN):
+        return False, "", "unavailable"
+    try:
+        res = subprocess.run(
+            ["sudo", "-n", USB_STORAGE_BIN, "mount", dev],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False, "", "usb_mount_failed"
+
+    if res.returncode == 0:
+        lines = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
+        mountpoint = lines[-1] if lines else ""
+        if mountpoint:
+            return True, mountpoint, ""
+        return False, "", "usb_mount_failed"
+    if res.returncode == 3:
+        return False, "", "usb_incompatible_fs"
+    return False, "", "usb_mount_failed"
+
+
+def format_usb_drive_exfat(device_path, label="MC_BACKUPS"):
+    """Format a validated external USB drive to exFAT and mount it for Windows use."""
+    dev = str(device_path or "").strip()
+    lbl = str(label or "MC_BACKUPS").strip()
+    if not USB_DEV_PATH_RE.match(dev) or not re.match(r"^[A-Za-z0-9_-]{1,11}$", lbl):
+        return False, "", "usb_invalid_device"
+    connected = detect_external_usb_drives()
+    if not any(d.get("device") == dev for d in connected):
+        return False, "", "usb_invalid_device"
+    if not os.path.exists(USB_STORAGE_BIN):
+        return False, "", "usb_format_failed"
+    try:
+        res = subprocess.run(
+            ["sudo", "-n", USB_STORAGE_BIN, "format-exfat", dev, lbl],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False, "", "usb_format_failed"
+
+    if res.returncode == 0:
+        lines = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
+        mountpoint = lines[-1] if lines else ""
+        if mountpoint:
+            return True, mountpoint, ""
+    return False, "", "usb_format_failed"
+
+
+def _match_configured_usb_drive(cfg, configured_loc, drive_list):
+    """Find the connected USB drive matching the saved backup configuration."""
+    for drv in drive_list:
+        if drv.get("id") == configured_loc:
+            return drv
+    saved_uuid = str(cfg.get("usb_uuid") or "").strip()
+    if saved_uuid:
+        for drv in drive_list:
+            if drv.get("uuid") == saved_uuid:
+                return drv
+    saved_dev = str(cfg.get("usb_device") or "").strip()
+    if saved_dev:
+        for drv in drive_list:
+            if drv.get("device") == saved_dev:
+                return drv
+    return None
+
+
+def resolve_backup_storage(backup_cfg=None, drives=None):
+    """Resolve active backup directory, auto-mounting USB drives or falling back internally."""
+    cfg = backup_cfg if backup_cfg is not None else read_backup_config()
+    configured_loc = str(cfg.get("backup_location") or "default").strip() or "default"
+    fallback_base = {
+        "configured_location": configured_loc,
+        "active_dir": BACKUP_DIR,
+        "is_usb_active": False,
+        "format_type": "tar_gz",
+    }
+    if configured_loc == "default":
+        return {**fallback_base, "configured_location": "default", "is_fallback": False, "status": "default", "drive": None}
+
+    drive_list = detect_external_usb_drives() if drives is None else drives
+    matched = _match_configured_usb_drive(cfg, configured_loc, drive_list)
+    if matched is None:
+        return {**fallback_base, "is_fallback": True, "status": "usb_unplugged_fallback", "drive": None}
+    if not matched.get("windows_compatible"):
+        return {**fallback_base, "is_fallback": True, "status": "usb_incompatible_fs", "drive": matched}
+
+    mountpoint = str(matched.get("mountpoint") or "").strip()
+    if not mountpoint:
+        ok, mounted_mp, _ = auto_mount_usb_drive(matched["device"])
+        if not ok or not mounted_mp:
+            return {**fallback_base, "is_fallback": True, "status": "usb_mount_failed", "drive": matched}
+        mountpoint = mounted_mp
+        matched = dict(matched)
+        matched["mountpoint"] = mountpoint
+        matched["backup_dir"] = os.path.join(mountpoint, "minecraft_backups")
+
+    usb_backup_dir = matched.get("backup_dir") or os.path.join(mountpoint, "minecraft_backups")
+    try:
+        os.makedirs(usb_backup_dir, exist_ok=True)
+    except OSError:
+        return {**fallback_base, "is_fallback": True, "status": "usb_mount_failed", "drive": matched}
+
+    return {
+        "configured_location": matched["id"],
+        "active_dir": usb_backup_dir,
+        "is_usb_active": True,
+        "is_fallback": False,
+        "status": "usb_active",
+        "drive": matched,
+        "format_type": "uncompressed_folder",
+    }
+
+
+def prune_backups(retention_days=7, max_backups=20, backup_dir=None):
+    """Prune expired or excess backup archives and uncompressed world folders."""
+    target_dir = backup_dir or resolve_backup_storage()["active_dir"]
+    if not os.path.exists(target_dir):
         return
     now = time.time()
     cutoff_sec = retention_days * 86400
-    valid_pattern = re.compile(r"^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$")
 
-    archives = []
-    for fname in os.listdir(BACKUP_DIR):
-        if valid_pattern.match(fname):
-            fpath = os.path.join(BACKUP_DIR, fname)
-            if os.path.isfile(fpath):
-                try:
-                    mtime = os.path.getmtime(fpath)
-                    if (now - mtime) > cutoff_sec:
-                        os.remove(fpath)
-                    else:
-                        archives.append((fpath, mtime))
-                except Exception:
-                    pass
+    entries = []
+    for fname in os.listdir(target_dir)[:2048]:
+        if not _is_valid_backup_name(fname):
+            continue
+        fpath = _resolve_safe_backup_path(target_dir, fname)
+        if not fpath or not (os.path.isfile(fpath) or os.path.isdir(fpath)):
+            continue
+        try:
+            mtime = os.path.getmtime(fpath)
+            if (now - mtime) > cutoff_sec:
+                _remove_backup_entry(fpath)
+            else:
+                entries.append((fpath, mtime))
+        except Exception:
+            pass
 
-    archives.sort(key=lambda x: x[1], reverse=True)
-    if len(archives) > max_backups:
-        for fpath, _ in archives[max_backups:]:
+    entries.sort(key=lambda x: x[1], reverse=True)
+    if len(entries) > max_backups:
+        for fpath, _ in entries[max_backups:]:
             try:
-                os.remove(fpath)
+                _remove_backup_entry(fpath)
             except Exception:
                 pass
+    _flush_filesystem_buffers()
 
 
-def list_backups():
+def list_backups(backup_dir=None):
+    """List available backup archives and uncompressed world backup folders."""
+    target_dir = backup_dir or resolve_backup_storage()["active_dir"]
     backups = []
-    if os.path.exists(BACKUP_DIR):
-        for fname in sorted(os.listdir(BACKUP_DIR), reverse=True):
-            if fname.endswith(".tar.gz") or fname.endswith(".zip"):
-                fpath = os.path.join(BACKUP_DIR, fname)
-                stat = os.stat(fpath)
-                size_mb = round(stat.st_size / (1024 * 1024), 2)
-                mtime_str = time.strftime(
-                    "%Y-%m-%d %H:%M:%S UTC", time.gmtime(stat.st_mtime)
-                )
-                backups.append(
-                    {
-                        "filename": fname,
-                        "size_mb": size_mb,
-                        "modified": mtime_str,
-                    }
-                )
+    if not os.path.exists(target_dir):
+        return backups
+    for fname in sorted(os.listdir(target_dir), reverse=True)[:2048]:
+        if not _is_valid_backup_name(fname):
+            continue
+        fpath = _resolve_safe_backup_path(target_dir, fname)
+        if not fpath or not os.path.exists(fpath):
+            continue
+        is_dir = os.path.isdir(fpath)
+        if not is_dir and not (fname.endswith(".tar.gz") or fname.endswith(".zip")):
+            continue
+        stat = os.stat(fpath)
+        size_mb = round(_get_entry_size_bytes(fpath) / (1024 * 1024), 2)
+        mtime_str = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(stat.st_mtime))
+        backups.append({
+            "filename": fname,
+            "size_mb": size_mb,
+            "modified": mtime_str,
+            "is_dir": is_dir,
+        })
     return backups
+
+
+def restore_backup_entry(fpath):
+    """Restore world files and configs from an uncompressed backup folder or archive."""
+    if os.path.isdir(fpath):
+        src_worlds = os.path.join(fpath, "worlds")
+        dest_worlds = get_active_worlds_dir()
+        os.makedirs(dest_worlds, exist_ok=True)
+        if os.path.isdir(src_worlds):
+            for entry in sorted(os.listdir(src_worlds))[:256]:
+                if entry in (".", "..") or os.sep in entry or "/" in entry:
+                    continue
+                src_item = os.path.join(src_worlds, entry)
+                dest_item = os.path.join(dest_worlds, entry)
+                if os.path.isdir(src_item):
+                    if os.path.isdir(dest_item) and not os.path.islink(dest_item):
+                        shutil.rmtree(dest_item)
+                    elif os.path.exists(dest_item) or os.path.islink(dest_item):
+                        os.remove(dest_item)
+                    shutil.copytree(src_item, dest_item, symlinks=False)
+                elif os.path.isfile(src_item):
+                    shutil.copy2(src_item, dest_item)
+        os.makedirs(BASE_DIR, exist_ok=True)
+        for cfg_name in ("server.properties", "allowlist.json", "permissions.json"):
+            src_cfg = os.path.join(fpath, cfg_name)
+            if os.path.isfile(src_cfg):
+                shutil.copy2(src_cfg, os.path.join(BASE_DIR, cfg_name))
+        return
+
+    if fpath.endswith(".tar.gz") and os.path.isfile(fpath):
+        subprocess.run(["tar", "-xzhf", fpath, "-C", BASE_DIR], timeout=60)
+        return
+
+    if fpath.endswith(".zip") and os.path.isfile(fpath):
+        base_abs = os.path.abspath(BASE_DIR)
+        with zipfile.ZipFile(fpath, "r") as zf:
+            for member in zf.infolist()[:10000]:
+                target_path = os.path.abspath(os.path.join(base_abs, member.filename))
+                if os.path.commonpath([base_abs, target_path]) != base_abs:
+                    raise ValueError("Security violation: Archive member path traversal detected")
+            zf.extractall(base_abs)
 
 
 def get_active_worlds_dir():
@@ -3184,6 +3888,107 @@ def render_address_management_card(address_cfg, props, flash_code=""):
     """
 
 
+def render_backup_location_controls(backup_cfg, storage_info, drives, active_worlds_dir):
+    """Render the Backup Save Location dropdown, status info, and USB exFAT format UI."""
+    configured_loc = str(backup_cfg.get("backup_location") or "default").strip() or "default"
+    matched_drive = storage_info.get("drive")
+    selected_id = matched_drive["id"] if matched_drive else configured_loc
+
+    options = [
+        f'<option value="default" {"selected" if configured_loc == "default" else ""}>'
+        f'Default Internal Storage ({html_lib.escape(BACKUP_DIR)})</option>'
+    ]
+    seen_ids = set()
+    for drv in drives[:32]:
+        drv_id = drv["id"]
+        seen_ids.add(drv_id)
+        fstype_disp = (drv.get("fstype") or "UNFORMATTED").upper()
+        compat_tag = (
+            "Windows PC Ready - Uncompressed World Files"
+            if drv.get("windows_compatible")
+            else "Requires exFAT Format for Windows"
+        )
+        opt_label = (
+            f"External USB: {drv['label']} ({drv['device']} — "
+            f"{fstype_disp}, {drv['size_gb']} GiB) [{compat_tag}]"
+        )
+        is_sel = "selected" if selected_id == drv_id else ""
+        options.append(
+            f'<option value="{html_lib.escape(drv_id, quote=True)}" {is_sel}>'
+            f'{html_lib.escape(opt_label)}</option>'
+        )
+
+    if configured_loc != "default" and storage_info.get("status") == "usb_unplugged_fallback" and configured_loc not in seen_ids:
+        saved_lbl = backup_cfg.get("usb_label") or backup_cfg.get("usb_device") or backup_cfg.get("usb_uuid") or "Saved USB Drive"
+        saved_ref = backup_cfg.get("usb_device") or backup_cfg.get("usb_uuid") or "USB"
+        fallback_label = f"External USB: {saved_lbl} ({saved_ref}) [Currently Unplugged — Using Internal Fallback]"
+        options.append(
+            f'<option value="{html_lib.escape(configured_loc, quote=True)}" selected>'
+            f'{html_lib.escape(fallback_label)}</option>'
+        )
+
+    status_key = storage_info.get("status", "default")
+    if status_key == "usb_active":
+        status_badge = _status_badge_html("SUCCESS").replace(">SUCCESS<", ">USB ACTIVE<")
+        fmt_desc = "<strong>Uncompressed World Folders</strong> (directly readable in Windows File Explorer when plugged into a Windows PC)"
+    elif storage_info.get("is_fallback"):
+        status_badge = _status_badge_html("WARN").replace(">WARN<", ">INTERNAL FALLBACK<")
+        fmt_desc = "<strong>Compressed Archive (.tar.gz)</strong>"
+    else:
+        status_badge = _status_badge_html("INFO").replace(">INFO<", ">DEFAULT INTERNAL<")
+        fmt_desc = "<strong>Compressed Archive (.tar.gz)</strong>"
+
+    fallback_reasons = {
+        "usb_unplugged_fallback": "Configured external USB drive is currently unplugged; backups are saved to Default Internal Storage until reconnected.",
+        "usb_incompatible_fs": "Selected external USB drive is not formatted with a Windows-compatible filesystem (exFAT, FAT32, or NTFS). Format it to exFAT below or backups will stay on internal storage.",
+        "usb_mount_failed": "Selected external USB drive failed to mount; backups are temporarily falling back to Default Internal Storage.",
+    }
+    fallback_note = ""
+    if status_key in fallback_reasons:
+        fallback_note = f'<div style="color:#856404; margin-top:4px;"><strong>Notice:</strong> {html_lib.escape(fallback_reasons[status_key])}</div>'
+
+    location_html = f"""
+      <div class="form-group">
+        <label for="backup_location">Backup Save Location (World Backups Only)</label>
+        <select id="backup_location" name="backup_location">
+          {"".join(options)}
+        </select>
+        <div style="background:#f8f9fa; border:1px solid #e9ecef; border-radius:4px; padding:10px 12px; margin-top:8px; font-size:13px; color:#495057;">
+          <div><strong>Active Backup Path:</strong> <code>{html_lib.escape(storage_info['active_dir'])}</code> {status_badge}</div>
+          <div style="margin-top:4px;"><strong>Backup Format:</strong> {fmt_desc}</div>
+          {fallback_note}
+          <div style="margin-top:4px; color:#6c757d;">Active live world remains on primary server storage (<code>{html_lib.escape(active_worlds_dir)}</code>) so gameplay speed is unaffected.</div>
+        </div>
+      </div>
+    """
+
+    format_usb_html = ""
+    if drives:
+        dev_opts = []
+        for drv in drives[:32]:
+            fstype_disp = (drv.get("fstype") or "UNFORMATTED").upper()
+            dev_lbl = f"{drv['label']} ({drv['device']} — {fstype_disp}, {drv['size_gb']} GiB)"
+            dev_opts.append(
+                f'<option value="{html_lib.escape(drv["device"], quote=True)}">'
+                f'{html_lib.escape(dev_lbl)}</option>'
+            )
+        format_usb_html = f"""
+    <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
+    <h3>Prepare / Format External USB Drive for Windows PC (exFAT)</h3>
+    <form method="POST" action="/backup/format_usb" onsubmit="return confirm('WARNING: Formatting will PERMANENTLY ERASE ALL FILES on the selected USB drive and format it as exFAT so it works directly on both Raspberry Pi and Windows PCs. Continue?');">
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <select name="usb_device" id="format_usb_device" style="flex:1; min-width:260px;">
+          {"".join(dev_opts)}
+        </select>
+        <button class="btn btn-danger" type="submit" style="margin:0; white-space:nowrap;">Format USB Drive to exFAT (Windows Compatible)</button>
+      </div>
+      <small style="display:block; color:#666; margin-top:6px;">Formats the selected external USB drive as exFAT (erases existing drive data), mounts it automatically, and selects it for world backups.</small>
+    </form>
+        """
+
+    return location_html, format_usb_html
+
+
 class WebUIHandler(http.server.BaseHTTPRequestHandler):
     def check_auth(self):
         auth_header = self.headers.get("Authorization")
@@ -3248,9 +4053,11 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
         status = get_service_status()
         props = read_properties()
-        backups = list_backups()
         stats = get_device_stats()
         backup_cfg = read_backup_config()
+        usb_drives = detect_external_usb_drives()
+        storage_info = resolve_backup_storage(backup_cfg=backup_cfg, drives=usb_drives)
+        backups = list_backups(backup_dir=storage_info["active_dir"])
         address_cfg = read_address_config()
         update_status = read_update_status()
         unified_players, default_role = get_unified_players()
@@ -3259,6 +4066,11 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         address_card_html = render_address_management_card(address_cfg, props, flash_code=flash_code)
         update_flash = query.get("update_msg", [""])[0]
         reinstall_card_html = render_reinstall_card(update_status, flash_code=update_flash)
+        backup_flash = query.get("backup_err", [""])[0] or query.get("backup_msg", [""])[0]
+        backup_flash_html = _render_flash_banner(backup_flash, BACKUP_FLASH_MESSAGES)
+        backup_location_html, format_usb_html = render_backup_location_controls(
+            backup_cfg, storage_info, usb_drives, stats.get("worlds_path", get_active_worlds_dir())
+        )
 
         status_color = "#28a745" if "ACTIVE" in status else "#dc3545"
 
@@ -3469,6 +4281,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
   <div class="card">
     <h2>Automated Backup Schedule & Retention Policy</h2>
+    {backup_flash_html}
     <form method="POST" action="/backup/settings">
       <div class="grid">
         <div class="form-group">
@@ -3498,6 +4311,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         </div>
       </div>
 
+      {backup_location_html}
+
       <div style="margin-top: 10px; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
         <button class="btn btn-primary" type="submit">Save Backup Configuration</button>
       </div>
@@ -3514,12 +4329,13 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         <button class="btn btn-warning btn-sm" type="submit">Prune Expired Backups Now</button>
       </form>
     </div>
+    {format_usb_html}
   </div>
 
   <div class="card">
     <h2>Available Server Backups ({len(backups)})</h2>
     <p style="font-size:14px; color:#555; margin-bottom:15px;">
-      Auto-Schedule: {schedule_badge} &nbsp;|&nbsp; Retention: <strong>{retention_days} days</strong> / Max <strong>{max_backups} archives</strong>
+      Auto-Schedule: {schedule_badge} &nbsp;|&nbsp; Retention: <strong>{retention_days} days</strong> / Max <strong>{max_backups} archives</strong> &nbsp;|&nbsp; Save Path: <code>{html_lib.escape(storage_info['active_dir'])}</code>
     </p>
 
     <form method="POST" action="/backup/batch_delete" id="batchDeleteForm" onsubmit="return confirmBatchDelete();">
@@ -3532,7 +4348,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         <thead>
           <tr>
             <th style="width:30px;"><input type="checkbox" id="selectAll" onclick="toggleSelectAll(this)" title="Select All"></th>
-            <th>Backup Archive</th>
+            <th>Backup Entry</th>
             <th>Size</th>
             <th>Timestamp</th>
             <th>Actions</th>
@@ -3545,18 +4361,24 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         else:
             for b in backups:
                 fname = b["filename"]
+                esc_fname = html_lib.escape(fname, quote=True)
                 fsize = b["size_mb"]
-                ftime = b["modified"]
+                ftime = html_lib.escape(b["modified"])
+                type_badge = (
+                    '<span class="badge" style="background:#28a745; margin-left:6px;">Folder (Windows Ready)</span>'
+                    if b.get("is_dir")
+                    else '<span class="badge" style="background:#6c757d; margin-left:6px;">Archive</span>'
+                )
                 html += f"""<tr>
-                  <td><input type="checkbox" name="files" value="{fname}" class="backup-chk"></td>
-                  <td><code>{fname}</code></td>
+                  <td><input type="checkbox" name="files" value="{esc_fname}" class="backup-chk"></td>
+                  <td><code>{esc_fname}</code> {type_badge}</td>
                   <td>{fsize} MiB</td>
                   <td>{ftime}</td>
                   <td>
                     <div class="action-group">
                       <a href="/backup/download?file={urllib.parse.quote(fname)}" class="btn btn-primary btn-sm">Download</a>
-                      <button class="btn btn-restart btn-sm" type="button" onclick="if(confirm('Restore backup {fname}? Current world will be backed up and replaced.')) {{ document.getElementById('restore_file').value='{fname}'; document.getElementById('singleRestoreForm').submit(); }}">Restore</button>
-                      <button class="btn btn-danger btn-sm" type="button" onclick="if(confirm('Delete backup {fname}?')) {{ document.getElementById('delete_file').value='{fname}'; document.getElementById('singleDeleteForm').submit(); }}">Delete</button>
+                      <button class="btn btn-restart btn-sm" type="button" onclick="if(confirm('Restore backup {esc_fname}? Current world will be backed up and replaced.')) {{ document.getElementById('restore_file').value='{esc_fname}'; document.getElementById('singleRestoreForm').submit(); }}">Restore</button>
+                      <button class="btn btn-danger btn-sm" type="button" onclick="if(confirm('Delete backup {esc_fname}?')) {{ document.getElementById('delete_file').value='{esc_fname}'; document.getElementById('singleDeleteForm').submit(); }}">Delete</button>
                     </div>
                   </td>
                 </tr>"""
@@ -3772,13 +4594,39 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_backup_download(self, query):
         filename = query.get("file", [""])[0]
-        if not re.match(r'^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$', filename):
+        if not _is_valid_backup_name(filename):
             self.send_error(HTTPStatus.BAD_REQUEST, "Invalid backup filename parameter.")
             return
 
-        filepath = os.path.join(BACKUP_DIR, filename)
-        if not os.path.exists(filepath):
+        active_dir = resolve_backup_storage()["active_dir"]
+        filepath = _resolve_safe_backup_path(active_dir, filename)
+        if (not filepath or not os.path.exists(filepath)) and active_dir != BACKUP_DIR:
+            filepath = _resolve_safe_backup_path(BACKUP_DIR, filename)
+        if not filepath or not os.path.exists(filepath):
             self.send_error(HTTPStatus.NOT_FOUND, "Backup file not found.")
+            return
+
+        if os.path.isdir(filepath):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                dir_count = 0
+                for root, _, files in os.walk(filepath, followlinks=False):
+                    dir_count += 1
+                    if dir_count > 4096:
+                        break
+                    for file in files[:4096]:
+                        full_p = os.path.join(root, file)
+                        if os.path.isfile(full_p) and not os.path.islink(full_p):
+                            rel_p = os.path.relpath(full_p, filepath)
+                            zf.write(full_p, rel_p)
+            zip_data = buf.getvalue()
+            out_name = f"{filename}.zip"
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{out_name}"')
+            self.send_header("Content-Length", str(len(zip_data)))
+            self.end_headers()
+            self.wfile.write(zip_data)
             return
 
         stat = os.stat(filepath)
@@ -3915,62 +4763,61 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             execute_action("restart")
 
         elif path == "/backup/settings":
-            auto_on = params.get("auto_backup_enabled", ["false"])[0].lower() in ["true", "on", "1"]
-            raw_interval = params.get("interval_hours", ["6"])[0]
-            raw_retention = params.get("retention_days", ["7"])[0]
-            raw_max = params.get("max_backups", ["20"])[0]
+            redirect_url = _handle_backup_settings_post(params)
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", redirect_url)
+            self.end_headers()
+            return
 
-            interval_val = int(raw_interval) if raw_interval.isdigit() and int(raw_interval) in [1, 3, 6, 12, 24, 168] else 6
-            retention_val = max(1, min(365, int(raw_retention))) if raw_retention.isdigit() else 7
-            max_val = max(1, min(100, int(raw_max))) if raw_max.isdigit() else 20
-
-            cfg = read_backup_config()
-            cfg["auto_backup_enabled"] = auto_on
-            cfg["interval_hours"] = interval_val
-            cfg["retention_days"] = retention_val
-            cfg["max_backups"] = max_val
-            save_backup_config(cfg)
+        elif path == "/backup/format_usb":
+            redirect_url = _handle_backup_format_usb_post(params)
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", redirect_url)
+            self.end_headers()
+            return
 
         elif path == "/backup/prune":
             cfg = read_backup_config()
-            prune_backups(cfg.get("retention_days", 7), cfg.get("max_backups", 20))
+            active_dir = resolve_backup_storage(backup_cfg=cfg)["active_dir"]
+            prune_backups(cfg.get("retention_days", 7), cfg.get("max_backups", 20), backup_dir=active_dir)
 
         elif path == "/backup/batch_delete":
-            file_list = params.get("files", [])
-            valid_pattern = re.compile(r"^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$")
-            for fname in file_list:
-                if valid_pattern.match(fname):
-                    fpath = os.path.join(BACKUP_DIR, fname)
-                    if os.path.exists(fpath):
-                        os.remove(fpath)
+            active_dir = resolve_backup_storage()["active_dir"]
+            for fname in params.get("files", [])[:2048]:
+                fpath = _resolve_safe_backup_path(active_dir, fname.strip())
+                if fpath and os.path.exists(fpath):
+                    _remove_backup_entry(fpath)
+            _flush_filesystem_buffers()
 
         elif path == "/backup/delete_all":
-            if os.path.exists(BACKUP_DIR):
-                valid_pattern = re.compile(r"^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$")
-                for fname in os.listdir(BACKUP_DIR):
-                    if valid_pattern.match(fname):
-                        fpath = os.path.join(BACKUP_DIR, fname)
-                        if os.path.isfile(fpath):
-                            os.remove(fpath)
+            active_dir = resolve_backup_storage()["active_dir"]
+            if os.path.exists(active_dir):
+                for fname in os.listdir(active_dir)[:2048]:
+                    fpath = _resolve_safe_backup_path(active_dir, fname)
+                    if fpath and os.path.exists(fpath):
+                        _remove_backup_entry(fpath)
+                _flush_filesystem_buffers()
 
         elif path == "/backup/restore":
             fname = params.get("filename", [""])[0].strip()
-            if re.match(r'^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$', fname):
-                fpath = os.path.join(BACKUP_DIR, fname)
-                if os.path.exists(fpath):
-                    execute_action("backup")
-                    execute_action("stop")
-                    if fname.endswith(".tar.gz"):
-                        subprocess.run(["tar", "-xzhf", fpath, "-C", BASE_DIR], timeout=60)
-                    subprocess.run(["sudo", "chown", "-R", f"{SERVER_USER}:{SERVER_GROUP}", "/opt/minecraft"], timeout=30)
-                    execute_action("start")
+            active_dir = resolve_backup_storage()["active_dir"]
+            fpath = _resolve_safe_backup_path(active_dir, fname)
+            if (not fpath or not os.path.exists(fpath)) and active_dir != BACKUP_DIR:
+                fpath = _resolve_safe_backup_path(BACKUP_DIR, fname)
+            if fpath and os.path.exists(fpath):
+                execute_action("backup")
+                execute_action("stop")
+                restore_backup_entry(fpath)
+                subprocess.run(["sudo", "chown", "-R", f"{SERVER_USER}:{SERVER_GROUP}", "/opt/minecraft"], timeout=30)
+                execute_action("start")
 
         elif path == "/backup/delete":
             fname = params.get("filename", [""])[0].strip()
-            if re.match(r'^bedrock_backup_[a-zA-Z0-9_.-]+\.(tar\.gz|zip)$', fname):
-                fpath = os.path.join(BACKUP_DIR, fname)
-                if os.path.exists(fpath):
-                    os.remove(fpath)
+            active_dir = resolve_backup_storage()["active_dir"]
+            fpath = _resolve_safe_backup_path(active_dir, fname)
+            if fpath and os.path.exists(fpath):
+                _remove_backup_entry(fpath)
+                _flush_filesystem_buffers()
         elif path in ("/address/save", "/address/check", "/address/clear"):
             redirect_url = _handle_address_post(path, params)
             self.send_response(HTTPStatus.SEE_OTHER)
@@ -3987,6 +4834,110 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", "/")
         self.end_headers()
+
+
+def _handle_backup_settings_post(params):
+    """Validate and save backup schedule, retention, and backup save location."""
+    auto_on = params.get("auto_backup_enabled", ["false"])[0].lower() in ["true", "on", "1"]
+    raw_interval = params.get("interval_hours", ["6"])[0]
+    raw_retention = params.get("retention_days", ["7"])[0]
+    raw_max = params.get("max_backups", ["20"])[0]
+
+    interval_val = int(raw_interval) if raw_interval.isdigit() and int(raw_interval) in [1, 3, 6, 12, 24, 168] else 6
+    retention_val = max(1, min(365, int(raw_retention))) if raw_retention.isdigit() else 7
+    max_val = max(1, min(100, int(raw_max))) if raw_max.isdigit() else 20
+
+    cfg = read_backup_config()
+    cfg["auto_backup_enabled"] = auto_on
+    cfg["interval_hours"] = interval_val
+    cfg["retention_days"] = retention_val
+    cfg["max_backups"] = max_val
+
+    loc = params.get("backup_location", ["default"])[0].strip() or "default"
+    if loc == "default":
+        cfg["backup_location"] = "default"
+        cfg["usb_device"] = ""
+        cfg["usb_uuid"] = ""
+        cfg["usb_label"] = ""
+        cfg["usb_mountpoint"] = ""
+        save_backup_config(cfg)
+        return "/?backup_msg=settings_saved"
+
+    if not loc.startswith("usb:"):
+        save_backup_config(cfg)
+        return "/?backup_err=usb_invalid_device"
+
+    drives = detect_external_usb_drives()
+    drv = next((d for d in drives if d.get("id") == loc), None)
+    if drv is None:
+        if loc == cfg.get("backup_location"):
+            save_backup_config(cfg)
+            return "/?backup_msg=usb_unplugged_saved"
+        save_backup_config(cfg)
+        return "/?backup_err=usb_invalid_device"
+
+    if not drv.get("windows_compatible"):
+        save_backup_config(cfg)
+        return "/?backup_err=usb_incompatible_fs"
+
+    mountpoint = str(drv.get("mountpoint") or "").strip()
+    if not mountpoint:
+        ok, mounted_mp, err_code = auto_mount_usb_drive(drv["device"])
+        if not ok or not mounted_mp:
+            save_backup_config(cfg)
+            err_key = err_code if err_code in BACKUP_FLASH_MESSAGES else "usb_mount_failed"
+            return f"/?backup_err={err_key}"
+        mountpoint = mounted_mp
+
+    try:
+        os.makedirs(os.path.join(mountpoint, "minecraft_backups"), exist_ok=True)
+    except OSError:
+        save_backup_config(cfg)
+        return "/?backup_err=usb_mount_failed"
+
+    cfg["backup_location"] = drv["id"]
+    cfg["usb_device"] = drv["device"]
+    cfg["usb_uuid"] = drv["uuid"]
+    cfg["usb_label"] = drv["label"]
+    cfg["usb_mountpoint"] = mountpoint
+    save_backup_config(cfg)
+    return "/?backup_msg=usb_mounted"
+
+
+def _handle_backup_format_usb_post(params):
+    """Format a selected external USB drive as exFAT, mount it, and configure backups."""
+    usb_device = params.get("usb_device", [""])[0].strip()
+    ok, mountpoint, err_code = format_usb_drive_exfat(usb_device)
+    if not ok or not mountpoint:
+        err_key = err_code if err_code in BACKUP_FLASH_MESSAGES else "usb_format_failed"
+        return f"/?backup_err={err_key}"
+
+    drives = detect_external_usb_drives()
+    drv = next((d for d in drives if d.get("device") == usb_device), None)
+    cfg = read_backup_config()
+    if drv:
+        final_mp = drv.get("mountpoint") or mountpoint
+        try:
+            os.makedirs(os.path.join(final_mp, "minecraft_backups"), exist_ok=True)
+        except OSError:
+            return "/?backup_err=usb_mount_failed"
+        cfg["backup_location"] = drv["id"]
+        cfg["usb_device"] = drv["device"]
+        cfg["usb_uuid"] = drv["uuid"]
+        cfg["usb_label"] = drv["label"]
+        cfg["usb_mountpoint"] = final_mp
+    else:
+        try:
+            os.makedirs(os.path.join(mountpoint, "minecraft_backups"), exist_ok=True)
+        except OSError:
+            return "/?backup_err=usb_mount_failed"
+        cfg["backup_location"] = f"usb:DEV={usb_device}"
+        cfg["usb_device"] = usb_device
+        cfg["usb_uuid"] = ""
+        cfg["usb_label"] = os.path.basename(usb_device)
+        cfg["usb_mountpoint"] = mountpoint
+    save_backup_config(cfg)
+    return "/?backup_msg=usb_formatted"
 
 
 def _handle_address_post(path, params):
@@ -4044,7 +4995,7 @@ PYEOF
 
     # Configure bounded sudoers permissions for mcserver
     cat > "${sudoers_file}" << 'EOF'
-mcserver ALL=(ALL) NOPASSWD: /usr/bin/systemctl start minecraft-bedrock.service, /usr/bin/systemctl stop minecraft-bedrock.service, /usr/bin/systemctl restart minecraft-bedrock.service, /usr/bin/systemctl is-active minecraft-bedrock.service, /usr/local/bin/mc-backup, /usr/local/bin/mc-permission, /usr/local/bin/mc-reinstall --async
+mcserver ALL=(ALL) NOPASSWD: /usr/bin/systemctl start minecraft-bedrock.service, /usr/bin/systemctl stop minecraft-bedrock.service, /usr/bin/systemctl restart minecraft-bedrock.service, /usr/bin/systemctl is-active minecraft-bedrock.service, /usr/local/bin/mc-backup, /usr/local/bin/mc-permission, /usr/local/bin/mc-reinstall --async, /usr/local/bin/mc-usb-storage
 EOF
     chmod 440 "${sudoers_file}"
 

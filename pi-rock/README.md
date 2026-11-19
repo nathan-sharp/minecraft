@@ -81,9 +81,10 @@ This implementation utilizes `box64`, a dynamic binary translator and userspace 
 > [!WARNING]
 > **Dependency and Supply Chain Verification (OWASP LLM Top 10 / ASVS V5)**
 >
-> This deployment integrates third-party software repositories:
+> This deployment integrates third-party software repositories and distribution packages:
 > 1. `box64-debs` maintained by Ryan Fortner (`https://ryanfortner.github.io/box64-debs/`).
 > 2. Official Mojang binary download servers (`https://minecraft.azureedge.net/`).
+> 3. Distribution `exfatprogs` package via APT (`mkfs.exfat` and exFAT USB filesystem utilities).
 >
 > You must independently verify package signatures, repository keys, and network origins before production deployment.
 
@@ -272,8 +273,14 @@ The installer provisions an automated backup utility at `/usr/local/bin/mc-backu
 Backup parameters reside in `/opt/minecraft/backup_config.json`:
 - `auto_backup_enabled`: Enable or disable automated scheduled execution (`true`/`false`).
 - `interval_hours`: Interval between automated backups in hours (`1`, `3`, `6`, `12`, `24`, `168`).
-- `retention_days`: Maximum age in days before a backup archive is pruned (default: `7`).
-- `max_backups`: Maximum total backup archives to retain on disk (default: `20`).
+- `retention_days`: Maximum age in days before a backup archive or folder is pruned (default: `7`).
+- `max_backups`: Maximum total backup archives or folders to retain on disk (default: `20`).
+- `backup_location`: Save target (`"default"` for `/opt/minecraft/backups`, or `"usb:UUID=<UUID>"` / `"usb:DEV=<PATH>"` for an external USB drive). Only world backups are saved to the selected USB drive; the active live world remains on primary server storage (`/opt/minecraft/bedrock/worlds`) so gameplay performance is unaffected.
+
+#### 1a. External USB World Backups (Windows PC Compatible)
+- **Uncompressed World Folders**: When a Windows-compatible external USB drive (`exFAT`, `FAT32`, or `NTFS`) is selected in the **Backup Save Location** dropdown, `mc-backup` saves backups as uncompressed world folders under `<USB_MOUNT>/minecraft_backups/bedrock_backup_<TIMESTAMP>/` (containing `worlds/<level-name>/`, `server.properties`, `allowlist.json`, and `permissions.json`) and flushes filesystem buffers with `sync`. You can unplug the drive from the Raspberry Pi and view all world files directly in Windows File Explorer.
+- **Auto-Mount & Format to exFAT**: The Web UI automatically mounts connected Windows-compatible USB drives via `/usr/local/bin/mc-usb-storage`. For Linux-formatted (`ext4`) or unformatted USB drives, use **Format USB Drive to exFAT (Windows Compatible)** in the Web UI (requires confirmation and erases existing data on the USB drive).
+- **Automatic Unplugged Fallback**: If the configured external USB drive is unplugged when a manual or scheduled backup executes, `mc-backup` automatically falls back to `/opt/minecraft/backups` until the USB drive is reconnected.
 
 #### 2. Manual Backup and Prune Commands
 - **Trigger Immediate Backup**:
@@ -457,9 +464,12 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
   - Add players with Gamertag, optional 16-digit XUID, and initial role.
   - Direct XUID permission overrides.
 - **Automated Backup & Retention Controls**:
+  - Select **Backup Save Location** between **Default Internal Storage** (`/opt/minecraft/backups`) and connected external USB drives (world backups only; active live gameplay world remains on primary storage).
+  - Auto-mounts Windows-compatible USB drives (`exFAT`, `FAT32`, `NTFS`) and stores uncompressed world folders directly readable on Windows PCs, with automatic internal fallback when unplugged.
+  - Format connected non-Windows or unformatted USB drives to `exFAT` directly from the Web UI with confirmation.
   - Configure automated backup schedules (Every 1h, 3h, 6h, 12h, 24h, 168h).
   - Define retention thresholds in days (e.g. 7 days) and maximum archive counts (e.g. 20 archives).
-  - Trigger on-demand retention pruning to remove expired or excess archives.
+  - Trigger on-demand retention pruning to remove expired or excess archives or backup folders.
 - **World & Backup Archive Management**:
   - Download the active live world as an `.mcworld` package directly to your computer.
   - Upload existing worlds (`.mcworld`, `.zip`, `.tar.gz`) with automatic pre-import safety backups.
