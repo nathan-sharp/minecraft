@@ -1036,9 +1036,14 @@ class TestExternalUSBBackupStorage(unittest.TestCase):
                 old_ts = time.time() - (15 * 86400)
                 os.utime(bk_old, (old_ts, old_ts))
 
-                # Act: list, prune, download zip, restore, delete
+                # Act: list, prune (with retention rules active), download zip, restore, delete
                 listed_before = webui.list_backups(backup_dir=usb_bk_dir)
-                webui.prune_backups(retention_days=7, max_backups=10, backup_dir=usb_bk_dir)
+                webui.prune_backups(
+                    retention_days=7,
+                    max_backups=10,
+                    backup_dir=usb_bk_dir,
+                    usb_keep_until_full=False,
+                )
                 listed_after_prune = webui.list_backups(backup_dir=usb_bk_dir)
 
                 dl_status, dl_hdrs, dl_bytes = self._http_call(
@@ -1121,10 +1126,18 @@ class TestExternalUSBBackupStorage(unittest.TestCase):
                     srv.server_address[1],
                     "POST",
                     "/backup/settings",
-                    body="auto_backup_enabled=true&interval_hours=6&retention_days=7&max_backups=20&backup_location=usb%3AUUID%3DWIN-001",
+                    body="auto_backup_enabled=true&interval_hours=6&retention_days=7&max_backups=20&usb_keep_until_full=true&backup_location=usb%3AUUID%3DWIN-001",
                     headers=post_hdrs,
                 )
                 saved_cfg = webui.read_backup_config()
+                s_uncheck, h_uncheck, _ = self._http_call(
+                    srv.server_address[1],
+                    "POST",
+                    "/backup/settings",
+                    body="auto_backup_enabled=true&interval_hours=6&retention_days=7&max_backups=20&backup_location=usb%3AUUID%3DWIN-001",
+                    headers=post_hdrs,
+                )
+                saved_cfg_unchecked = webui.read_backup_config()
 
                 s_bad_fmt, h_bad_fmt, _ = self._http_call(
                     srv.server_address[1],
@@ -1146,6 +1159,8 @@ class TestExternalUSBBackupStorage(unittest.TestCase):
                 self.assertEqual(s_get, 200)
                 page = body_bytes.decode("utf-8")
                 self.assertIn('name="backup_location"', page)
+                self.assertIn('name="usb_keep_until_full"', page)
+                self.assertIn('id="usb_keep_until_full" name="usb_keep_until_full" value="true" checked', page)
                 self.assertIn("Default Internal Storage", page)
                 self.assertIn("External USB: MC_DRIVE (/dev/sda1", page)
                 self.assertIn("Windows PC Ready - Uncompressed World Files", page)
@@ -1156,6 +1171,11 @@ class TestExternalUSBBackupStorage(unittest.TestCase):
                 self.assertEqual(h_set.get("Location"), "/?backup_msg=usb_mounted")
                 self.assertEqual(saved_cfg["backup_location"], "usb:UUID=WIN-001")
                 self.assertEqual(saved_cfg["usb_mountpoint"], usb_mp)
+                self.assertTrue(saved_cfg["usb_keep_until_full"])
+
+                self.assertEqual(s_uncheck, 303)
+                self.assertEqual(h_uncheck.get("Location"), "/?backup_msg=usb_mounted")
+                self.assertFalse(saved_cfg_unchecked["usb_keep_until_full"])
 
                 self.assertEqual(s_bad_fmt, 303)
                 self.assertEqual(h_bad_fmt.get("Location"), "/?backup_err=usb_invalid_device")
@@ -1168,6 +1188,64 @@ class TestExternalUSBBackupStorage(unittest.TestCase):
                 srv.server_close()
                 for p in reversed(patchers):
                     p.stop()
+
+    def test_usb_keep_until_full_ignores_retention_and_prunes_oldest_when_full(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bk_cfg_file = os.path.join(tmpdir, "backup_config.json")
+            usb_bk_dir = os.path.join(tmpdir, "usb_backups")
+            os.makedirs(usb_bk_dir, exist_ok=True)
+            names = [
+                "bedrock_backup_20261001_000000",
+                "bedrock_backup_20261015_000000",
+                "bedrock_backup_20261119_120000",
+            ]
+            now = time.time()
+            ages_days = [45, 30, 0]
+            for name, age in zip(names, ages_days):
+                folder = os.path.join(usb_bk_dir, name)
+                os.makedirs(os.path.join(folder, "worlds", "Bedrock level"), exist_ok=True)
+                with open(os.path.join(folder, "worlds", "Bedrock level", "level.dat"), "wb") as f:
+                    f.write(b"DATA")
+                ts = now - (age * 86400)
+                os.utime(folder, (ts, ts))
+
+            fake_usage_enough = mock.Mock(free=10_000)
+            usage_seq = [
+                mock.Mock(free=10),
+                mock.Mock(free=20),
+                mock.Mock(free=10_000),
+            ]
+
+            with mock.patch.object(webui, "BACKUP_CONFIG_FILE", bk_cfg_file):
+                default_cfg = webui.read_backup_config()
+
+                # Act 1: plenty of free space -> ignores retention_days=7 and max_backups=1
+                with mock.patch("webui.shutil.disk_usage", return_value=fake_usage_enough):
+                    webui.prune_backups(
+                        retention_days=7,
+                        max_backups=1,
+                        backup_dir=usb_bk_dir,
+                        is_usb_active=True,
+                        min_free_bytes=100,
+                    )
+                after_plenty = sorted(os.listdir(usb_bk_dir))
+
+                # Act 2: storage low -> deletes oldest backups first until free >= min_free_bytes
+                with mock.patch("webui.shutil.disk_usage", side_effect=usage_seq):
+                    webui.prune_backups(
+                        retention_days=7,
+                        max_backups=1,
+                        backup_dir=usb_bk_dir,
+                        is_usb_active=True,
+                        min_free_bytes=100,
+                    )
+                after_full = sorted(os.listdir(usb_bk_dir))
+
+            # Assert
+            self.assertTrue(default_cfg["usb_keep_until_full"])
+            self.assertEqual(after_plenty, names)
+            self.assertEqual(after_full, ["bedrock_backup_20261119_120000"])
 
 
 if __name__ == "__main__":

@@ -276,9 +276,11 @@ Backup parameters reside in `/opt/minecraft/backup_config.json`:
 - `retention_days`: Maximum age in days before a backup archive or folder is pruned (default: `7`).
 - `max_backups`: Maximum total backup archives or folders to retain on disk (default: `20`).
 - `backup_location`: Save target (`"default"` for `/opt/minecraft/backups`, or `"usb:UUID=<UUID>"` / `"usb:DEV=<PATH>"` for an external USB drive). Only world backups are saved to the selected USB drive; the active live world remains on primary server storage (`/opt/minecraft/bedrock/worlds`) so gameplay performance is unaffected.
+- `usb_keep_until_full`: Enabled by default (`true`). When saving to an external USB drive, ignores `retention_days` and `max_backups` and keeps all backups until the USB drive fills up, automatically deleting the oldest backups only when needed to free space.
 
 #### 1a. External USB World Backups (Windows PC Compatible)
 - **Uncompressed World Folders**: When a Windows-compatible external USB drive (`exFAT`, `FAT32`, or `NTFS`) is selected in the **Backup Save Location** dropdown, `mc-backup` saves backups as uncompressed world folders under `<USB_MOUNT>/minecraft_backups/bedrock_backup_<TIMESTAMP>/` (containing `worlds/<level-name>/`, `server.properties`, `allowlist.json`, and `permissions.json`) and flushes filesystem buffers with `sync`. You can unplug the drive from the Raspberry Pi and view all world files directly in Windows File Explorer.
+- **Capacity-Based USB Retention**: With **On External USB Drives: Ignore Retention Rules & Keep Backups Until Storage Is Full** enabled (default), `mc-backup` and the Web UI skip age and count limits on the USB drive and delete the oldest backups only when free space drops below the next backup size plus a 64 MiB safety margin.
 - **Auto-Mount & Format to exFAT**: The Web UI automatically mounts connected Windows-compatible USB drives via `/usr/local/bin/mc-usb-storage`. For Linux-formatted (`ext4`) or unformatted USB drives, use **Format USB Drive to exFAT (Windows Compatible)** in the Web UI (requires confirmation and erases existing data on the USB drive).
 - **Automatic Unplugged Fallback**: If the configured external USB drive is unplugged when a manual or scheduled backup executes, `mc-backup` automatically falls back to `/opt/minecraft/backups` until the USB drive is reconnected.
 
@@ -466,6 +468,7 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
 - **Automated Backup & Retention Controls**:
   - Select **Backup Save Location** between **Default Internal Storage** (`/opt/minecraft/backups`) and connected external USB drives (world backups only; active live gameplay world remains on primary storage).
   - Auto-mounts Windows-compatible USB drives (`exFAT`, `FAT32`, `NTFS`) and stores uncompressed world folders directly readable on Windows PCs, with automatic internal fallback when unplugged.
+  - Enabled-by-default **Keep Backups Until Storage Is Full** toggle for USB drives (ignores age/count limits and deletes oldest backups only when storage fills up).
   - Format connected non-Windows or unformatted USB drives to `exFAT` directly from the Web UI with confirmation.
   - Configure automated backup schedules (Every 1h, 3h, 6h, 12h, 24h, 168h).
   - Define retention thresholds in days (e.g. 7 days) and maximum archive counts (e.g. 20 archives).

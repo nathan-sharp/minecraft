@@ -371,7 +371,8 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
   "usb_device": "",
   "usb_uuid": "",
   "usb_label": "",
-  "usb_mountpoint": ""
+  "usb_mountpoint": "",
+  "usb_keep_until_full": true
 }
 JSONEOF
     chown mcserver:mcserver "${CONFIG_FILE}" 2>/dev/null || true
@@ -498,17 +499,141 @@ except OSError:
 "
 }
 
-# Function to execute dual retention pruning (days threshold + max backup count)
+# Return "true" when usb_keep_until_full is enabled in configuration (default: true)
+is_usb_keep_until_full() {
+    python3 -c "
+import json, os
+
+config_file = '${CONFIG_FILE}'
+enabled = True
+if os.path.exists(config_file):
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        enabled = bool(cfg.get('usb_keep_until_full', True))
+    except Exception:
+        enabled = True
+print('true' if enabled else 'false')
+"
+}
+
+# Evict oldest backups on USB before creating a new backup when free space is below world size + 64 MiB
+ensure_usb_space_for_backup() {
+    local target_dir="$1"
+    python3 -c "
+import os, re, shutil, sys
+
+backup_dir = sys.argv[1]
+worlds_dir = os.path.realpath('${SOURCE_DIR}/worlds') if os.path.islink('${SOURCE_DIR}/worlds') else '${SOURCE_DIR}/worlds'
+buffer_bytes = 64 * 1024 * 1024
+pattern = re.compile(r'^bedrock_backup_[a-zA-Z0-9_.-]+(?:\.(?:tar\.gz|zip))?$')
+
+def entry_size(path):
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    if not os.path.isdir(path):
+        return 0
+    total = 0
+    dcount = 0
+    for root, _, files in os.walk(path, followlinks=False):
+        dcount += 1
+        if dcount > 4096:
+            break
+        for fn in files[:4096]:
+            fp = os.path.join(root, fn)
+            try:
+                if os.path.isfile(fp) and not os.path.islink(fp):
+                    total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total
+
+entries = []
+if os.path.exists(backup_dir):
+    for fname in os.listdir(backup_dir)[:2048]:
+        if '..' not in fname and pattern.match(fname):
+            fpath = os.path.join(backup_dir, fname)
+            if os.path.isfile(fpath) or os.path.isdir(fpath):
+                try:
+                    entries.append((fpath, os.path.getmtime(fpath), fname))
+                except OSError:
+                    pass
+
+entries.sort(key=lambda x: (x[1], x[2]))
+latest_size = entry_size(entries[-1][0]) if entries else 0
+required = max(entry_size(worlds_dir), latest_size) + buffer_bytes
+
+for fpath, _, fname in entries:
+    try:
+        free_b = shutil.disk_usage(backup_dir).free
+    except OSError:
+        break
+    if free_b >= required:
+        break
+    try:
+        if os.path.isdir(fpath) and not os.path.islink(fpath):
+            shutil.rmtree(fpath)
+        else:
+            os.remove(fpath)
+        print(f'[INFO] USB storage nearly full; removed oldest backup before new backup: {fname}')
+    except OSError:
+        pass
+if hasattr(os, 'sync'):
+    os.sync()
+" "${target_dir}"
+}
+
+# Remove the single oldest existing backup (excluding current destination) when a USB copy runs out of space
+evict_oldest_usb_backup() {
+    local target_dir="$1"
+    local exclude_dir="$2"
+    python3 -c "
+import os, re, shutil, sys
+
+backup_dir, exclude_path = sys.argv[1], os.path.abspath(sys.argv[2])
+pattern = re.compile(r'^bedrock_backup_[a-zA-Z0-9_.-]+(?:\.(?:tar\.gz|zip))?$')
+entries = []
+if os.path.exists(backup_dir):
+    for fname in os.listdir(backup_dir)[:2048]:
+        if '..' not in fname and pattern.match(fname):
+            fpath = os.path.abspath(os.path.join(backup_dir, fname))
+            if fpath == exclude_path:
+                continue
+            if os.path.isfile(fpath) or os.path.isdir(fpath):
+                try:
+                    entries.append((fpath, os.path.getmtime(fpath), fname))
+                except OSError:
+                    pass
+if not entries:
+    sys.exit(1)
+entries.sort(key=lambda x: (x[1], x[2]))
+oldest_path, _, oldest_name = entries[0]
+if os.path.isdir(oldest_path) and not os.path.islink(oldest_path):
+    shutil.rmtree(oldest_path)
+else:
+    os.remove(oldest_path)
+print(f'[INFO] Evicted oldest USB backup to reclaim space: {oldest_name}')
+if hasattr(os, 'sync'):
+    os.sync()
+" "${target_dir}" "${exclude_dir}"
+}
+
+# Function to execute retention pruning (capacity-based on USB when enabled, or day/count limits)
 prune_archives() {
     local target_dir="${1:-${BACKUP_ROOT}}"
+    local target_mode="${2:-default}"
     python3 -c "
 import os, time, json, re, shutil, sys
 
 config_file = '${CONFIG_FILE}'
 backup_dir = sys.argv[1]
+target_mode = sys.argv[2]
+worlds_dir = os.path.realpath('${SOURCE_DIR}/worlds') if os.path.islink('${SOURCE_DIR}/worlds') else '${SOURCE_DIR}/worlds'
+buffer_bytes = 64 * 1024 * 1024
 
 retention_days = 7
 max_backups = 20
+usb_keep_until_full = True
 
 if os.path.exists(config_file):
     try:
@@ -516,15 +641,73 @@ if os.path.exists(config_file):
             cfg = json.load(f)
             retention_days = int(cfg.get('retention_days', 7))
             max_backups = int(cfg.get('max_backups', 20))
+            usb_keep_until_full = bool(cfg.get('usb_keep_until_full', True))
     except Exception:
         pass
 
 if not os.path.exists(backup_dir):
     exit(0)
 
+pattern = re.compile(r'^bedrock_backup_[a-zA-Z0-9_.-]+(?:\.(?:tar\.gz|zip))?$')
+
+def entry_size(path):
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    if not os.path.isdir(path):
+        return 0
+    total = 0
+    dcount = 0
+    for root, _, files in os.walk(path, followlinks=False):
+        dcount += 1
+        if dcount > 4096:
+            break
+        for fn in files[:4096]:
+            fp = os.path.join(root, fn)
+            try:
+                if os.path.isfile(fp) and not os.path.islink(fp):
+                    total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total
+
+if target_mode == 'usb' and usb_keep_until_full:
+    usb_entries = []
+    for fname in os.listdir(backup_dir)[:2048]:
+        if '..' not in fname and pattern.match(fname):
+            fpath = os.path.join(backup_dir, fname)
+            if os.path.isfile(fpath) or os.path.isdir(fpath):
+                try:
+                    usb_entries.append((fpath, os.path.getmtime(fpath), fname))
+                except OSError:
+                    pass
+    usb_entries.sort(key=lambda x: (x[1], x[2]))
+    latest_size = entry_size(usb_entries[-1][0]) if usb_entries else 0
+    required = max(entry_size(worlds_dir), latest_size) + buffer_bytes
+    remaining = len(usb_entries)
+    for fpath, _, fname in usb_entries:
+        if remaining <= 1:
+            break
+        try:
+            free_b = shutil.disk_usage(backup_dir).free
+        except OSError:
+            break
+        if free_b >= required:
+            break
+        try:
+            if os.path.isdir(fpath) and not os.path.islink(fpath):
+                shutil.rmtree(fpath)
+            else:
+                os.remove(fpath)
+            remaining -= 1
+            print(f'[INFO] USB storage nearly full; pruned oldest backup: {fname}')
+        except OSError:
+            pass
+    if hasattr(os, 'sync'):
+        os.sync()
+    exit(0)
+
 now = time.time()
 cutoff = retention_days * 86400
-pattern = re.compile(r'^bedrock_backup_[a-zA-Z0-9_.-]+(?:\.(?:tar\.gz|zip))?$')
 
 entries = []
 for fname in os.listdir(backup_dir)[:2048]:
@@ -557,7 +740,7 @@ if len(entries) > max_backups:
             pass
 if hasattr(os, 'sync'):
     os.sync()
-" "${target_dir}"
+" "${target_dir}" "${target_mode}"
 }
 
 STORAGE_INFO="$(resolve_target_storage)"
@@ -566,7 +749,7 @@ TARGET_BACKUP_ROOT="${STORAGE_INFO#*$'\t'}"
 
 if [[ "${MODE}" == "--prune" ]]; then
     echo "[INFO] Executing backup retention pruning in ${TARGET_BACKUP_ROOT}..."
-    prune_archives "${TARGET_BACKUP_ROOT}"
+    prune_archives "${TARGET_BACKUP_ROOT}" "${TARGET_MODE}"
     exit 0
 fi
 
@@ -605,19 +788,41 @@ fi
 
 mkdir -p "${TARGET_BACKUP_ROOT}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+USB_KEEP_UNTIL_FULL="$(is_usb_keep_until_full)"
 
 if [[ "${TARGET_MODE}" == "usb" ]]; then
     DEST_FOLDER="${TARGET_BACKUP_ROOT}/bedrock_backup_${TIMESTAMP}"
     echo "[INFO] Creating uncompressed Windows-compatible world backup: ${DEST_FOLDER}..."
-    mkdir -p "${DEST_FOLDER}/worlds"
-    if [[ -d "${SOURCE_DIR}/worlds" ]] && find "${SOURCE_DIR}/worlds" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-        cp -rL "${SOURCE_DIR}/worlds/." "${DEST_FOLDER}/worlds/"
+    if [[ "${USB_KEEP_UNTIL_FULL}" == "true" ]]; then
+        ensure_usb_space_for_backup "${TARGET_BACKUP_ROOT}"
     fi
-    for cfg_item in server.properties allowlist.json permissions.json; do
-        if [[ -f "${SOURCE_DIR}/${cfg_item}" ]]; then
-            cp -f "${SOURCE_DIR}/${cfg_item}" "${DEST_FOLDER}/${cfg_item}"
+    COPY_OK=0
+    for ATTEMPT in 1 2 3; do
+        mkdir -p "${DEST_FOLDER}/worlds"
+        if (
+            if [[ -d "${SOURCE_DIR}/worlds" ]] && find "${SOURCE_DIR}/worlds" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+                cp -rL "${SOURCE_DIR}/worlds/." "${DEST_FOLDER}/worlds/"
+            fi
+            for cfg_item in server.properties allowlist.json permissions.json; do
+                if [[ -f "${SOURCE_DIR}/${cfg_item}" ]]; then
+                    cp -f "${SOURCE_DIR}/${cfg_item}" "${DEST_FOLDER}/${cfg_item}"
+                fi
+            done
+        ); then
+            COPY_OK=1
+            break
+        fi
+        echo "[WARN] USB copy attempt ${ATTEMPT} failed. Cleaning partial backup..." >&2
+        rm -rf "${DEST_FOLDER}" || true
+        sync
+        if [[ "${USB_KEEP_UNTIL_FULL}" != "true" ]] || ! evict_oldest_usb_backup "${TARGET_BACKUP_ROOT}" "${DEST_FOLDER}"; then
+            break
         fi
     done
+    if [[ "${COPY_OK}" -ne 1 ]]; then
+        echo "[ERROR] Failed to write backup to external USB drive ${TARGET_BACKUP_ROOT}." >&2
+        exit 1
+    fi
     sync
     BACKUP_ARTIFACT="${DEST_FOLDER}"
 else
@@ -659,8 +864,8 @@ if os.path.exists(config_file):
 chown -R mcserver:mcserver "${TARGET_BACKUP_ROOT}" "${CONFIG_FILE}" 2>/dev/null || true
 chmod 664 "${CONFIG_FILE}" 2>/dev/null || true
 
-# Execute dual retention pruning
-prune_archives "${TARGET_BACKUP_ROOT}"
+# Execute retention pruning
+prune_archives "${TARGET_BACKUP_ROOT}" "${TARGET_MODE}"
 sync
 
 echo "[INFO] Backup completed successfully: ${BACKUP_ARTIFACT}"
@@ -687,7 +892,8 @@ EOF
   "usb_device": "",
   "usb_uuid": "",
   "usb_label": "",
-  "usb_mountpoint": ""
+  "usb_mountpoint": "",
+  "usb_keep_until_full": true
 }
 EOF
         chown mcserver:mcserver /opt/minecraft/backup_config.json
@@ -1798,6 +2004,7 @@ USB_STORAGE_BIN = "/usr/local/bin/mc-usb-storage"
 WINDOWS_COMPATIBLE_FSTYPES = ("exfat", "vfat", "fat32", "msdos", "ntfs", "ntfs3")
 BACKUP_NAME_RE = re.compile(r"^bedrock_backup_[a-zA-Z0-9_.-]+(?:\.(?:tar\.gz|zip))?$")
 USB_DEV_PATH_RE = re.compile(r"^/dev/(?:sd[a-z][0-9]*|nvme[0-9]+n[0-9]+p[0-9]+|vd[a-z][0-9]*)$")
+USB_SPACE_BUFFER_BYTES = 64 * 1024 * 1024
 
 DEFAULT_BACKUP_CONFIG = {
     "auto_backup_enabled": True,
@@ -1810,6 +2017,7 @@ DEFAULT_BACKUP_CONFIG = {
     "usb_uuid": "",
     "usb_label": "",
     "usb_mountpoint": "",
+    "usb_keep_until_full": True,
 }
 
 BACKUP_FLASH_MESSAGES = {
@@ -2295,11 +2503,91 @@ def resolve_backup_storage(backup_cfg=None, drives=None):
     }
 
 
-def prune_backups(retention_days=7, max_backups=20, backup_dir=None):
-    """Prune expired or excess backup archives and uncompressed world folders."""
-    target_dir = backup_dir or resolve_backup_storage()["active_dir"]
+def _estimate_required_backup_bytes(entries=None):
+    """Estimate disk bytes required for the next world backup plus safety buffer."""
+    world_size = _get_entry_size_bytes(get_active_worlds_dir())
+    latest_size = 0
+    if entries:
+        newest_entry = max(entries, key=lambda x: (x[1], x[2]))
+        latest_size = _get_entry_size_bytes(newest_entry[0])
+    return max(world_size, latest_size) + USB_SPACE_BUFFER_BYTES
+
+
+def prune_usb_until_space_available(backup_dir, min_free_bytes=None, keep_minimum=1):
+    """Evict oldest backups on USB storage only when free space drops below threshold."""
+    if not os.path.exists(backup_dir):
+        return
+    entries = []
+    for fname in os.listdir(backup_dir)[:2048]:
+        if not _is_valid_backup_name(fname):
+            continue
+        fpath = _resolve_safe_backup_path(backup_dir, fname)
+        if not fpath or not (os.path.isfile(fpath) or os.path.isdir(fpath)):
+            continue
+        try:
+            mtime = os.path.getmtime(fpath)
+            entries.append((fpath, mtime, fname))
+        except OSError:
+            pass
+
+    entries.sort(key=lambda x: (x[1], x[2]))
+    required_free = (
+        int(min_free_bytes)
+        if min_free_bytes is not None
+        else _estimate_required_backup_bytes(entries)
+    )
+
+    remaining = len(entries)
+    for fpath, _, _ in entries:
+        if remaining <= keep_minimum:
+            break
+        try:
+            free_bytes = shutil.disk_usage(backup_dir).free
+        except OSError:
+            break
+        if free_bytes >= required_free:
+            break
+        try:
+            _remove_backup_entry(fpath)
+            remaining -= 1
+        except OSError:
+            pass
+    _flush_filesystem_buffers()
+
+
+def prune_backups(
+    retention_days=7,
+    max_backups=20,
+    backup_dir=None,
+    is_usb_active=None,
+    usb_keep_until_full=None,
+    min_free_bytes=None,
+):
+    """Prune expired or excess backups, or evict oldest on USB only when storage is full."""
+    cfg = None
+    if backup_dir is None or is_usb_active is None or usb_keep_until_full is None:
+        cfg = read_backup_config()
+    if usb_keep_until_full is None:
+        usb_keep_until_full = bool(cfg.get("usb_keep_until_full", True))
+    if backup_dir is None or is_usb_active is None:
+        storage = resolve_backup_storage(backup_cfg=cfg)
+        if backup_dir is None:
+            backup_dir = storage["active_dir"]
+        if is_usb_active is None:
+            is_usb_active = bool(storage.get("is_usb_active"))
+
+    target_dir = backup_dir
     if not os.path.exists(target_dir):
         return
+
+    if is_usb_active and usb_keep_until_full:
+        prune_usb_until_space_available(
+            target_dir,
+            min_free_bytes=min_free_bytes,
+            keep_minimum=1,
+        )
+        return
+
     now = time.time()
     cutoff_sec = retention_days * 86400
 
@@ -3927,6 +4215,7 @@ def render_backup_location_controls(backup_cfg, storage_info, drives, active_wor
             f'{html_lib.escape(fallback_label)}</option>'
         )
 
+    usb_keep_until_full = bool(backup_cfg.get("usb_keep_until_full", True))
     status_key = storage_info.get("status", "default")
     if status_key == "usb_active":
         status_badge = _status_badge_html("SUCCESS").replace(">SUCCESS<", ">USB ACTIVE<")
@@ -3937,6 +4226,10 @@ def render_backup_location_controls(backup_cfg, storage_info, drives, active_wor
     else:
         status_badge = _status_badge_html("INFO").replace(">INFO<", ">DEFAULT INTERNAL<")
         fmt_desc = "<strong>Compressed Archive (.tar.gz)</strong>"
+
+    retention_policy_note = ""
+    if status_key == "usb_active" and usb_keep_until_full:
+        retention_policy_note = '<div style="margin-top:4px;"><strong>Active Retention Policy:</strong> Keep Until USB Storage Full (Auto-Delete Oldest When Full)</div>'
 
     fallback_reasons = {
         "usb_unplugged_fallback": "Configured external USB drive is currently unplugged; backups are saved to Default Internal Storage until reconnected.",
@@ -3953,9 +4246,17 @@ def render_backup_location_controls(backup_cfg, storage_info, drives, active_wor
         <select id="backup_location" name="backup_location">
           {"".join(options)}
         </select>
+        <div style="margin-top:10px;">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; text-transform:none; font-size:14px;">
+            <input type="checkbox" id="usb_keep_until_full" name="usb_keep_until_full" value="true" {"checked" if usb_keep_until_full else ""} style="width:20px; height:20px;">
+            <strong>On External USB Drives: Ignore Retention Rules &amp; Keep Backups Until Storage Is Full (Then Delete Oldest)</strong>
+          </label>
+          <small style="display:block; color:#666; margin-top:4px;">When enabled on an external USB drive, age and max-count limits are ignored until the drive fills up, then the oldest backups are deleted automatically.</small>
+        </div>
         <div style="background:#f8f9fa; border:1px solid #e9ecef; border-radius:4px; padding:10px 12px; margin-top:8px; font-size:13px; color:#495057;">
           <div><strong>Active Backup Path:</strong> <code>{html_lib.escape(storage_info['active_dir'])}</code> {status_badge}</div>
           <div style="margin-top:4px;"><strong>Backup Format:</strong> {fmt_desc}</div>
+          {retention_policy_note}
           {fallback_note}
           <div style="margin-top:4px; color:#6c757d;">Active live world remains on primary server storage (<code>{html_lib.escape(active_worlds_dir)}</code>) so gameplay speed is unaffected.</div>
         </div>
@@ -4078,6 +4379,13 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         interval_hrs = backup_cfg.get("interval_hours", 6)
         retention_days = backup_cfg.get("retention_days", 7)
         max_backups = backup_cfg.get("max_backups", 20)
+        usb_keep_until_full = bool(backup_cfg.get("usb_keep_until_full", True))
+        if storage_info.get("is_usb_active") and usb_keep_until_full:
+            retention_summary_html = "<strong>Keep Until USB Storage Full (Auto-Delete Oldest When Full)</strong>"
+            manual_prune_desc = "USB capacity mode active: ignores day/count limits and only deletes oldest backups if free space is low."
+        else:
+            retention_summary_html = f"<strong>{retention_days} days</strong> / Max <strong>{max_backups} archives</strong>"
+            manual_prune_desc = f"Prunes archives exceeding {retention_days} days or {max_backups} total files."
 
         interval_options = [
             (1, "Every 1 Hour"),
@@ -4323,7 +4631,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
       <div>
         <strong>Manual Retention Enforcement:</strong>
-        <span style="color:#666; font-size:13px; margin-left:6px;">Prunes archives exceeding {retention_days} days or {max_backups} total files.</span>
+        <span style="color:#666; font-size:13px; margin-left:6px;">{manual_prune_desc}</span>
       </div>
       <form method="POST" action="/backup/prune" style="margin:0;" onsubmit="return confirm('Execute retention prune now according to policy?');">
         <button class="btn btn-warning btn-sm" type="submit">Prune Expired Backups Now</button>
@@ -4335,7 +4643,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
   <div class="card">
     <h2>Available Server Backups ({len(backups)})</h2>
     <p style="font-size:14px; color:#555; margin-bottom:15px;">
-      Auto-Schedule: {schedule_badge} &nbsp;|&nbsp; Retention: <strong>{retention_days} days</strong> / Max <strong>{max_backups} archives</strong> &nbsp;|&nbsp; Save Path: <code>{html_lib.escape(storage_info['active_dir'])}</code>
+      Auto-Schedule: {schedule_badge} &nbsp;|&nbsp; Retention: {retention_summary_html} &nbsp;|&nbsp; Save Path: <code>{html_lib.escape(storage_info['active_dir'])}</code>
     </p>
 
     <form method="POST" action="/backup/batch_delete" id="batchDeleteForm" onsubmit="return confirmBatchDelete();">
@@ -4778,8 +5086,14 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == "/backup/prune":
             cfg = read_backup_config()
-            active_dir = resolve_backup_storage(backup_cfg=cfg)["active_dir"]
-            prune_backups(cfg.get("retention_days", 7), cfg.get("max_backups", 20), backup_dir=active_dir)
+            storage = resolve_backup_storage(backup_cfg=cfg)
+            prune_backups(
+                cfg.get("retention_days", 7),
+                cfg.get("max_backups", 20),
+                backup_dir=storage["active_dir"],
+                is_usb_active=storage["is_usb_active"],
+                usb_keep_until_full=cfg.get("usb_keep_until_full", True),
+            )
 
         elif path == "/backup/batch_delete":
             active_dir = resolve_backup_storage()["active_dir"]
@@ -4839,6 +5153,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 def _handle_backup_settings_post(params):
     """Validate and save backup schedule, retention, and backup save location."""
     auto_on = params.get("auto_backup_enabled", ["false"])[0].lower() in ["true", "on", "1"]
+    usb_keep_on = params.get("usb_keep_until_full", ["false"])[0].lower() in ["true", "on", "1"]
     raw_interval = params.get("interval_hours", ["6"])[0]
     raw_retention = params.get("retention_days", ["7"])[0]
     raw_max = params.get("max_backups", ["20"])[0]
@@ -4852,6 +5167,7 @@ def _handle_backup_settings_post(params):
     cfg["interval_hours"] = interval_val
     cfg["retention_days"] = retention_val
     cfg["max_backups"] = max_val
+    cfg["usb_keep_until_full"] = usb_keep_on
 
     loc = params.get("backup_location", ["default"])[0].strip() or "default"
     if loc == "default":
