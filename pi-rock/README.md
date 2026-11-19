@@ -308,15 +308,36 @@ Backup parameters reside in `/opt/minecraft/backup_config.json`:
    sudo systemctl start minecraft-bedrock.service
    ```
 
-### 7.3 Server Upgrades
+### 7.3 Server Upgrades and Force Reinstall
 
-The installer provisions an automated upgrade utility at `/usr/local/bin/mc-update`.
+The installer provisions two distinct upgrade utilities under `/usr/local/bin/`:
 
-1. Execute the update utility:
+| Utility | Update Target | Data Preserved |
+| :--- | :--- | :--- |
+| **`mc-update`** | Official Mojang Bedrock Dedicated Server (BDS) binaries only. | Worlds, `server.properties`, allowlists, and permissions. |
+| **`mc-reinstall`** | Full Pi-Rock toolkit (`setup_bedrock_server.sh`, `webui.py`, `mc-*` utilities, systemd units, and BDS). | Worlds, backups, `auth.json`, `backup_config.json`, `address_config.json`, and server configs. |
+
+#### Procedure: Updating Mojang BDS Binaries (`mc-update`)
+
+1. Run the update utility:
    ```bash
    sudo mc-update
    ```
-2. The utility stops the service, performs a safety backup, downloads new binaries, preserves server configuration files, and restarts the service.
+2. Wait until the utility backs up data, installs the BDS binary, and restarts `minecraft-bedrock.service`.
+
+#### Procedure: Force Reinstalling Latest Pi-Rock from GitHub (`mc-reinstall`)
+
+1. Connect to your Raspberry Pi via Secure Shell (SSH).
+2. Run the force reinstall utility to pull the `main` branch:
+   ```bash
+   sudo mc-reinstall
+   ```
+3. Pass a branch, tag, or commit Secure Hash Algorithm (SHA) to pin a specific release:
+   ```bash
+   sudo mc-reinstall <COMMIT_SHA>
+   ```
+4. Wait 15 to 60 seconds while `mc-reinstall` validates syntax, backs up world data, reinstalls files, and verifies service health.
+5. Check reinstall logs at `/opt/minecraft/webui/reinstall.log` if an error occurs.
 
 ### 7.4 External USB Storage Management
 
@@ -415,6 +436,9 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
   - Local verification of `minecraft-bedrock.service`, `/proc/net/udp` socket bindings, and local RakNet UDP ping responses.
   - Public Domain Name System (DNS) resolution, Wide Area Network (WAN) IP matching, Cloudflare Proxy detection, and User Datagram Protocol (UDP) tunnel detection.
   - External Bedrock reachability probes (IPv4 and IPv6) and external Web UI self-verification over Hypertext Transfer Protocol Secure (HTTPS) and Hypertext Transfer Protocol (HTTP).
+- **Software Version & Force Reinstall**:
+  - Displays the installed Git commit SHA, last update status, and timestamp from `/opt/minecraft/webui/update_status.json`.
+  - Triggers a full background GitHub reinstall using `sudo -n /usr/local/bin/mc-reinstall --async` inside an isolated systemd job.
 - **Hardware & System Telemetry**:
   - Primary root filesystem storage capacity, consumed space, free space, and utilization percentage.
   - World storage filesystem capacity, consumed space, free space, and mount path (identifies USB storage).
@@ -472,10 +496,19 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
 | **External Bedrock UDP (IPv6)** | External IPv6 RakNet scanner | Tested when an IPv6 literal or `AAAA` record exists. |
 | **External Web UI Reachability** | `https://<host>` and `http://<host>:8080` | `PASS` for verified Transport Layer Security (TLS) on port `443`; `WARN` for plaintext HTTP on port `8080`. |
 
+#### Procedure: Force Reinstalling Pi-Rock from the Web UI
+
+1. Open the **Software Version & Force Reinstall** card in the Web UI.
+2. Click **Force Reinstall Latest from GitHub**.
+3. Confirm the prompt.
+4. Wait 15 to 60 seconds while the server clones `main`, validates syntax, backs up world files, and restarts services.
+5. Click **Refresh Status** to confirm the status reports `SUCCESS` and displays the updated commit SHA.
+
 > [!WARNING]
 > **Security & External Endpoint Notice (OWASP ASVS V2, V4, V5, V9)**
 >
 > - **Plaintext HTTP Basic Authentication**: Never expose unencrypted port `8080` to the public WAN. Deploy a TLS reverse proxy or Cloudflare Tunnel on HTTPS port `443`.
+> - **Sudoers Trust Boundary (`mc-reinstall --async`)**: The Web UI account (`mcserver`) holds `NOPASSWD` sudo permission strictly for `/usr/local/bin/mc-reinstall --async`. Protect your Web UI password and GitHub `main` repository access, because triggering a reinstall executes code from `https://github.com/nathan-sharp/minecraft.git` as `root`.
 > - **Server-Side Request Forgery (SSRF) Defense**: The Web UI rejects private, loopback, link-local, Carrier-Grade NAT (CGNAT), and reserved IP targets before opening outbound sockets.
 > - **Third-Party Diagnostic Endpoints**: Saving or clicking **Re-check Now** sends outbound HTTPS requests to `api.ipify.org`, `ipv4.icanhazip.com`, `api6.ipify.org`, `api.mcstatus.io`, and `api.mcsrvstat.us`. Independently verify the availability and privacy posture of these external services before production use.
 

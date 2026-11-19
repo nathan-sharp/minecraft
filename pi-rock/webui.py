@@ -105,6 +105,27 @@ _CHALLENGE_LOCK = threading.Lock()
 _PENDING_CHALLENGES = {}
 _ADDRESS_CONFIG_LOCK = threading.Lock()
 
+UPDATE_STATUS_FILE = "/opt/minecraft/webui/update_status.json"
+REINSTALL_BIN = "/usr/local/bin/mc-reinstall"
+
+DEFAULT_UPDATE_STATUS = {
+    "status": "UNKNOWN",
+    "commit_sha": "",
+    "commit_short": "Unknown",
+    "commit_subject": "",
+    "target_ref": "main",
+    "updated_utc": "",
+    "trigger": "",
+    "message": "No reinstall recorded yet.",
+}
+
+UPDATE_FLASH_MESSAGES = {
+    "started": ("info", "Full GitHub reinstall started in the background. Wait 15 to 60 seconds and click Refresh Status."),
+    "already_running": ("error", "A reinstall job is already running. Wait for completion before retrying."),
+    "unavailable": ("error", "Force reinstall is unavailable. Run one manual git clone reinstall to install /usr/local/bin/mc-reinstall and sudoers permissions."),
+    "failed_launch": ("error", "Failed to launch the background reinstall service. Check system logs or run sudo mc-reinstall via SSH."),
+}
+
 VALID_PROPERTIES = {
     "server-name": str,
     "level-name": str,
@@ -1452,13 +1473,114 @@ def _status_badge_html(status):
     """Render an HTML status pill badge with fixed palette colors."""
     styles = {
         "PASS": ("#28a745", "#fff"),
+        "SUCCESS": ("#28a745", "#fff"),
         "WARN": ("#ffc107", "#000"),
+        "ROLLED_BACK": ("#ffc107", "#000"),
         "FAIL": ("#dc3545", "#fff"),
+        "FAILED": ("#dc3545", "#fff"),
         "INFO": ("#17a2b8", "#fff"),
+        "IN_PROGRESS": ("#17a2b8", "#fff"),
     }
     bg, fg = styles.get(status, ("#6c757d", "#fff"))
     label = html_lib.escape(status)
     return f'<span class="badge" style="background:{bg}; color:{fg};">{label}</span>'
+
+
+def _render_flash_banner(flash_code, message_map):
+    """Render an allow-listed flash alert banner without reflecting raw query parameters."""
+    if flash_code not in message_map:
+        return ""
+    kind, text = message_map[flash_code]
+    bg_map = {
+        "success": ("#d4edda", "#155724", "#c3e6cb"),
+        "error": ("#f8d7da", "#721c24", "#f5c6cb"),
+        "info": ("#d1ecf1", "#0c5460", "#bee5eb"),
+    }
+    bg, fg, bd = bg_map.get(kind, ("#e2e3e5", "#383d41", "#d6d8db"))
+    return f'<div style="background:{bg}; color:{fg}; border:1px solid {bd}; border-radius:4px; padding:10px 12px; margin-bottom:15px; font-size:14px;">{html_lib.escape(text)}</div>'
+
+
+def read_update_status():
+    """Load persisted Git reinstall status metadata safely."""
+    status = DEFAULT_UPDATE_STATUS.copy()
+    if os.path.exists(UPDATE_STATUS_FILE):
+        try:
+            with open(UPDATE_STATUS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                status.update(loaded)
+        except Exception:
+            pass
+    return status
+
+
+def trigger_force_reinstall():
+    """Trigger decoupled root reinstall via sudo -n /usr/local/bin/mc-reinstall --async."""
+    if not os.path.exists(REINSTALL_BIN):
+        return "unavailable"
+    try:
+        res = subprocess.run(
+            ["sudo", "-n", REINSTALL_BIN, "--async"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "failed_launch"
+    if res.returncode == 0:
+        return "started"
+    if res.returncode == 2:
+        return "already_running"
+    stderr_lower = (res.stderr or "").lower()
+    if "password" in stderr_lower or "not allowed" in stderr_lower or "sudo" in stderr_lower:
+        return "unavailable"
+    return "failed_launch"
+
+
+def render_reinstall_card(update_status, flash_code=""):
+    """Render the Software Version & Force Reinstall Web UI card safely."""
+    status_val = str(update_status.get("status") or "UNKNOWN")
+    status_badge = _status_badge_html(status_val)
+    flash_html = _render_flash_banner(flash_code, UPDATE_FLASH_MESSAGES)
+    commit_short = html_lib.escape(str(update_status.get("commit_short") or "Unknown"))
+    commit_sha = html_lib.escape(str(update_status.get("commit_sha") or ""), quote=True)
+    commit_subj = html_lib.escape(str(update_status.get("commit_subject") or ""))
+    updated_utc = html_lib.escape(str(update_status.get("updated_utc") or "Never"))
+    trigger_src = html_lib.escape(str(update_status.get("trigger") or "N/A"))
+    message = html_lib.escape(str(update_status.get("message") or ""))
+    subj_line = f'<div class="stat-sub">{commit_subj}</div>' if commit_subj else ""
+
+    return f"""
+  <div class="card">
+    <h2>Software Version &amp; Force Reinstall {status_badge}</h2>
+    {flash_html}
+    <div class="grid-3" style="margin-bottom: 15px;">
+      <div class="stat-box">
+        <div class="stat-label">Installed Git Commit</div>
+        <div class="stat-val" title="{commit_sha}"><code>{commit_short}</code></div>
+        {subj_line}
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Last Update Status</div>
+        <div class="stat-val" style="font-size:15px;">{html_lib.escape(status_val)} ({trigger_src})</div>
+        <div class="stat-sub">Updated: {updated_utc}</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">SSH Command Equivalent</div>
+        <div class="stat-sub" style="margin-top:6px;"><code>sudo mc-reinstall</code></div>
+        <div class="stat-sub">Pin commit: <code>sudo mc-reinstall &lt;sha&gt;</code></div>
+      </div>
+    </div>
+    <p style="font-size:13px; color:#555; margin:0 0 12px 0;"><strong>Last Result:</strong> {message}</p>
+    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+      <form method="POST" action="/system/reinstall" style="margin:0;" onsubmit="return confirm('Run a full force reinstall from GitHub main? This backs up your world, stops Bedrock for 10 to 60 seconds, updates all scripts and the Web UI, and restarts services.');">
+        <button class="btn btn-warning" type="submit" style="margin:0;">Force Reinstall Latest from GitHub</button>
+      </form>
+      <a href="/" class="btn btn-primary" style="margin:0;">Refresh Status</a>
+    </div>
+    <small style="display:block; color:#777; margin-top:8px;">Note: Performs pre-reinstall world backup, bash/Python syntax validation, and automatic Web UI rollback on service failure.</small>
+  </div>
+    """
 
 
 def _render_address_report_html(address_cfg, report, props):
@@ -1516,12 +1638,7 @@ def render_address_management_card(address_cfg, props, flash_code=""):
     overall = report.get("overall_status", "NOT CONFIGURED") if isinstance(report, dict) else "NOT CONFIGURED"
     overall_badge = _status_badge_html(overall)
 
-    flash_html = ""
-    if flash_code in ADDRESS_FLASH_MESSAGES:
-        kind, text = ADDRESS_FLASH_MESSAGES[flash_code]
-        bg_map = {"success": ("#d4edda", "#155724", "#c3e6cb"), "error": ("#f8d7da", "#721c24", "#f5c6cb"), "info": ("#d1ecf1", "#0c5460", "#bee5eb")}
-        bg, fg, bd = bg_map.get(kind, ("#e2e3e5", "#383d41", "#d6d8db"))
-        flash_html = f'<div style="background:{bg}; color:{fg}; border:1px solid {bd}; border-radius:4px; padding:10px 12px; margin-bottom:15px; font-size:14px;">{html_lib.escape(text)}</div>'
+    flash_html = _render_flash_banner(flash_code, ADDRESS_FLASH_MESSAGES)
 
     escaped_raw = html_lib.escape(raw_addr, quote=True)
     has_saved = bool(host)
@@ -1629,10 +1746,13 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         stats = get_device_stats()
         backup_cfg = read_backup_config()
         address_cfg = read_address_config()
+        update_status = read_update_status()
         unified_players, default_role = get_unified_players()
         current_level_name = props.get("level-name", "Bedrock level")
         flash_code = query.get("addr_err", [""])[0] or query.get("addr_msg", [""])[0]
         address_card_html = render_address_management_card(address_cfg, props, flash_code=flash_code)
+        update_flash = query.get("update_msg", [""])[0]
+        reinstall_card_html = render_reinstall_card(update_status, flash_code=update_flash)
 
         status_color = "#28a745" if "ACTIVE" in status else "#dc3545"
 
@@ -1770,6 +1890,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     </form>
   </div>
   {address_card_html}
+  {reinstall_card_html}
 
   <div class="card">
     <h2>Device & Hardware Telemetry</h2>
@@ -2348,6 +2469,12 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             redirect_url = _handle_address_post(path, params)
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", redirect_url)
+            self.end_headers()
+            return
+        elif path == "/system/reinstall":
+            code = trigger_force_reinstall()
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", f"/?update_msg={code}")
             self.end_headers()
             return
 

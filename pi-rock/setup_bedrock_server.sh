@@ -131,7 +131,8 @@ install_system_dependencies() {
         lsb-release \
         libssl3 \
         libcurl4 \
-        ufw
+        ufw \
+        git
 }
 
 install_box64() {
@@ -249,6 +250,11 @@ download_bedrock_server() {
     curl -L -A "${MOJANG_USER_AGENT}" "${download_url}" -o "${tmp_archive}"
 
     log_info "Extracting server archive to ${INSTALL_DIR}..."
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        log_info "Stopping running ${SERVICE_NAME} before extracting server binaries..."
+        systemctl stop "${SERVICE_NAME}" || true
+    fi
+
     # Preserve existing configuration files if present
     if [[ -f "${INSTALL_DIR}/server.properties" ]]; then
         cp "${INSTALL_DIR}/server.properties" "${INSTALL_DIR}/server.properties.bak"
@@ -1033,7 +1039,239 @@ EOF
         chmod 640 /opt/minecraft/bedrock/permissions.json
     fi
 
-    log_info "Administrative tools installed: /usr/local/bin/mc-backup, /usr/local/bin/mc-update, /usr/local/bin/mc-set-storage, /usr/local/bin/mc-allowlist, /usr/local/bin/mc-permission"
+    # 6. mc-reinstall tool (full force reinstall from hardcoded GitHub repo)
+    cat > /usr/local/bin/mc-reinstall.tmp << 'REINSTALLEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_URL="https://github.com/nathan-sharp/minecraft.git"
+WEBUI_DIR="/opt/minecraft/webui"
+STATUS_FILE="${WEBUI_DIR}/update_status.json"
+LOG_FILE="${WEBUI_DIR}/reinstall.log"
+WEBUI_SCRIPT="${WEBUI_DIR}/webui.py"
+WEBUI_BACKUP="${WEBUI_DIR}/webui.py.bak"
+LOCK_FILE="/run/lock/mc-reinstall.lock"
+if [[ ! -d /run/lock ]]; then
+    LOCK_FILE="/tmp/mc-reinstall.lock"
+fi
+
+write_status() {
+    local status_val="$1"
+    local sha_val="$2"
+    local short_val="$3"
+    local subj_val="$4"
+    local ref_val="$5"
+    local trig_val="$6"
+    local msg_val="$7"
+    mkdir -p "${WEBUI_DIR}"
+    python3 -c '
+import json, os, sys, time
+path, st, sha, short, subj, ref, trig, msg = sys.argv[1:9]
+data = {
+    "status": st,
+    "commit_sha": sha,
+    "commit_short": short or "Unknown",
+    "commit_subject": subj,
+    "target_ref": ref,
+    "updated_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+    "trigger": trig,
+    "message": msg,
+}
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+os.replace(tmp, path)
+' "${STATUS_FILE}" "${status_val}" "${sha_val}" "${short_val}" "${subj_val}" "${ref_val}" "${trig_val}" "${msg_val}"
+    chown mcserver:mcserver "${STATUS_FILE}" 2>/dev/null || true
+    chmod 644 "${STATUS_FILE}" 2>/dev/null || true
+}
+
+run_reinstall_job() {
+    local target_ref="$1"
+    local trigger_src="$2"
+
+    exec 9>"${LOCK_FILE}"
+    if ! flock -n 9; then
+        echo "[WARN] Another mc-reinstall process is already running." >&2
+        exit 2
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        echo "[INFO] Installing git prerequisite..."
+        export DEBIAN_FRONTEND=noninteractive
+        if ! (apt-get update -y && apt-get install -y --no-install-recommends git); then
+            write_status "FAILED" "" "Unknown" "" "${target_ref}" "${trigger_src}" "Failed to install git prerequisite."
+            exit 1
+        fi
+    fi
+
+    write_status "IN_PROGRESS" "" "Updating..." "" "${target_ref}" "${trigger_src}" "Cloning ${target_ref} from GitHub and running syntax checks..."
+
+    local tmp_dir=""
+    cleanup_tmp() {
+        if [[ -n "${tmp_dir}" && -d "${tmp_dir}" ]]; then
+            rm -rf "${tmp_dir}"
+        fi
+    }
+    trap cleanup_tmp EXIT
+    tmp_dir="$(mktemp -d /tmp/mc-reinstall-XXXXXX)"
+
+    echo "[INFO] Cloning ${REPO_URL} (ref: ${target_ref})..."
+    if [[ "${target_ref}" == "main" ]]; then
+        if ! git clone --depth 1 --branch main "${REPO_URL}" "${tmp_dir}"; then
+            write_status "FAILED" "" "Unknown" "" "${target_ref}" "${trigger_src}" "Git clone from GitHub main failed."
+            exit 1
+        fi
+    else
+        git -C "${tmp_dir}" init -q
+        git -C "${tmp_dir}" remote add origin "${REPO_URL}"
+        if git -C "${tmp_dir}" fetch --depth 1 origin "${target_ref}" >/dev/null 2>&1; then
+            git -C "${tmp_dir}" checkout -q FETCH_HEAD
+        elif git -C "${tmp_dir}" fetch --no-tags origin >/dev/null 2>&1 && git -C "${tmp_dir}" checkout -q "${target_ref}"; then
+            :
+        else
+            write_status "FAILED" "" "Unknown" "" "${target_ref}" "${trigger_src}" "Failed to fetch or checkout Git reference ${target_ref}."
+            exit 1
+        fi
+    fi
+
+    local commit_sha commit_short commit_subj
+    commit_sha="$(git -C "${tmp_dir}" rev-parse HEAD 2>/dev/null || echo "")"
+    commit_short="$(git -C "${tmp_dir}" rev-parse --short HEAD 2>/dev/null || echo "Unknown")"
+    commit_subj="$(git -C "${tmp_dir}" log -1 --pretty=%s 2>/dev/null || echo "")"
+
+    local installer_path="${tmp_dir}/pi-rock/setup_bedrock_server.sh"
+    local webui_new_path="${tmp_dir}/pi-rock/webui.py"
+    if [[ ! -f "${installer_path}" || ! -f "${webui_new_path}" ]]; then
+        write_status "FAILED" "${commit_sha}" "${commit_short}" "${commit_subj}" "${target_ref}" "${trigger_src}" "Missing pi-rock installer or webui.py in cloned repository."
+        exit 1
+    fi
+
+    sed -i 's/\r$//' "${installer_path}" "${webui_new_path}"
+
+    if ! bash -n "${installer_path}"; then
+        write_status "FAILED" "${commit_sha}" "${commit_short}" "${commit_subj}" "${target_ref}" "${trigger_src}" "Pre-flight bash syntax check failed; aborting without modifying host."
+        exit 1
+    fi
+    if ! python3 -m py_compile "${webui_new_path}"; then
+        write_status "FAILED" "${commit_sha}" "${commit_short}" "${commit_subj}" "${target_ref}" "${trigger_src}" "Pre-flight Python syntax check failed; aborting without modifying host."
+        exit 1
+    fi
+
+    if [[ -f "${WEBUI_SCRIPT}" ]]; then
+        cp -f "${WEBUI_SCRIPT}" "${WEBUI_BACKUP}"
+        chown mcserver:mcserver "${WEBUI_BACKUP}" 2>/dev/null || true
+    fi
+
+    if [[ -x /usr/local/bin/mc-backup ]]; then
+        echo "[INFO] Creating pre-reinstall safety backup..."
+        /usr/local/bin/mc-backup || true
+    fi
+
+    echo "[INFO] Stopping minecraft-bedrock.service for clean binary deployment..."
+    systemctl stop minecraft-bedrock.service || true
+
+    echo "[INFO] Executing ${installer_path}..."
+    set +e
+    bash "${installer_path}"
+    local install_rc=$?
+    set -e
+
+    sleep 3
+    if ! systemctl is-active --quiet minecraft-webui.service; then
+        echo "[ERROR] minecraft-webui.service failed to stay active after reinstall. Rolling back..."
+        if [[ -f "${WEBUI_BACKUP}" ]]; then
+            cp -f "${WEBUI_BACKUP}" "${WEBUI_SCRIPT}"
+            chown mcserver:mcserver "${WEBUI_SCRIPT}"
+            chmod 755 "${WEBUI_SCRIPT}"
+            systemctl restart minecraft-webui.service || true
+            sleep 2
+        fi
+        write_status "ROLLED_BACK" "${commit_sha}" "${commit_short}" "${commit_subj}" "${target_ref}" "${trigger_src}" "Web UI health check failed after reinstall and rolled back to previous webui.py.bak."
+        exit 1
+    fi
+
+    if ! systemctl is-active --quiet minecraft-bedrock.service; then
+        systemctl start minecraft-bedrock.service || true
+        sleep 3
+    fi
+
+    if [[ "${install_rc}" -eq 0 ]] && systemctl is-active --quiet minecraft-bedrock.service; then
+        write_status "SUCCESS" "${commit_sha}" "${commit_short}" "${commit_subj}" "${target_ref}" "${trigger_src}" "Full force reinstall completed and all services are active."
+        echo "[INFO] Force reinstall succeeded at commit ${commit_short}."
+        return 0
+    fi
+
+    write_status "FAILED" "${commit_sha}" "${commit_short}" "${commit_subj}" "${target_ref}" "${trigger_src}" "Installer exited with code ${install_rc} or Bedrock service failed to start."
+    exit 1
+}
+
+main_reinstall() {
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "[ERROR] This tool must be run as root: sudo mc-reinstall [ref]" >&2
+        exit 1
+    fi
+
+    if [[ "${1:-}" == "--async" ]]; then
+        if [[ "$#" -ne 1 ]]; then
+            echo "[ERROR] --async does not accept additional arguments." >&2
+            exit 1
+        fi
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet mc-reinstall-job.service 2>/dev/null; then
+            echo "[WARN] Reinstall job already running." >&2
+            exit 2
+        fi
+        exec 9>"${LOCK_FILE}"
+        if ! flock -n 9; then
+            echo "[WARN] Reinstall lock already held." >&2
+            exit 2
+        fi
+        exec 9>&-
+
+        mkdir -p "${WEBUI_DIR}"
+        write_status "IN_PROGRESS" "" "Updating..." "" "main" "webui" "Background force reinstall queued from Web UI."
+        if command -v systemd-run >/dev/null 2>&1; then
+            systemctl reset-failed mc-reinstall-job.service >/dev/null 2>&1 || true
+            systemd-run --no-block --collect --unit=mc-reinstall-job /usr/local/bin/mc-reinstall --run-detached
+        else
+            setsid /usr/local/bin/mc-reinstall --run-detached >/dev/null 2>&1 < /dev/null &
+        fi
+        exit 0
+    fi
+
+    if [[ "${1:-}" == "--run-detached" ]]; then
+        if [[ "$#" -ne 1 ]]; then
+            echo "[ERROR] --run-detached does not accept additional arguments." >&2
+            exit 1
+        fi
+        mkdir -p "${WEBUI_DIR}"
+        exec >> "${LOG_FILE}" 2>&1
+        echo "=== Detached Web UI Reinstall Started: $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
+        run_reinstall_job "main" "webui"
+        exit $?
+    fi
+
+    if [[ "$#" -gt 1 ]]; then
+        echo "Usage: sudo mc-reinstall [branch|tag|commit-sha]" >&2
+        exit 1
+    fi
+
+    local target_ref="${1:-main}"
+    if [[ ! "${target_ref}" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,63}$ ]] || [[ "${target_ref}" == *".."* ]]; then
+        echo "[ERROR] Invalid Git reference format: ${target_ref}" >&2
+        exit 1
+    fi
+
+    run_reinstall_job "${target_ref}" "cli"
+}
+
+main_reinstall "$@"
+exit $?
+REINSTALLEOF
+    chmod 755 /usr/local/bin/mc-reinstall.tmp
+    mv -f /usr/local/bin/mc-reinstall.tmp /usr/local/bin/mc-reinstall
+
+    log_info "Administrative tools installed: /usr/local/bin/mc-backup, /usr/local/bin/mc-update, /usr/local/bin/mc-set-storage, /usr/local/bin/mc-allowlist, /usr/local/bin/mc-permission, /usr/local/bin/mc-reinstall"
 }
 
 # ------------------------------------------------------------------------------
@@ -1167,6 +1405,27 @@ ADDRESS_FLASH_MESSAGES = {
 _CHALLENGE_LOCK = threading.Lock()
 _PENDING_CHALLENGES = {}
 _ADDRESS_CONFIG_LOCK = threading.Lock()
+
+UPDATE_STATUS_FILE = "/opt/minecraft/webui/update_status.json"
+REINSTALL_BIN = "/usr/local/bin/mc-reinstall"
+
+DEFAULT_UPDATE_STATUS = {
+    "status": "UNKNOWN",
+    "commit_sha": "",
+    "commit_short": "Unknown",
+    "commit_subject": "",
+    "target_ref": "main",
+    "updated_utc": "",
+    "trigger": "",
+    "message": "No reinstall recorded yet.",
+}
+
+UPDATE_FLASH_MESSAGES = {
+    "started": ("info", "Full GitHub reinstall started in the background. Wait 15 to 60 seconds and click Refresh Status."),
+    "already_running": ("error", "A reinstall job is already running. Wait for completion before retrying."),
+    "unavailable": ("error", "Force reinstall is unavailable. Run one manual git clone reinstall to install /usr/local/bin/mc-reinstall and sudoers permissions."),
+    "failed_launch": ("error", "Failed to launch the background reinstall service. Check system logs or run sudo mc-reinstall via SSH."),
+}
 
 VALID_PROPERTIES = {
     "server-name": str,
@@ -2515,13 +2774,114 @@ def _status_badge_html(status):
     """Render an HTML status pill badge with fixed palette colors."""
     styles = {
         "PASS": ("#28a745", "#fff"),
+        "SUCCESS": ("#28a745", "#fff"),
         "WARN": ("#ffc107", "#000"),
+        "ROLLED_BACK": ("#ffc107", "#000"),
         "FAIL": ("#dc3545", "#fff"),
+        "FAILED": ("#dc3545", "#fff"),
         "INFO": ("#17a2b8", "#fff"),
+        "IN_PROGRESS": ("#17a2b8", "#fff"),
     }
     bg, fg = styles.get(status, ("#6c757d", "#fff"))
     label = html_lib.escape(status)
     return f'<span class="badge" style="background:{bg}; color:{fg};">{label}</span>'
+
+
+def _render_flash_banner(flash_code, message_map):
+    """Render an allow-listed flash alert banner without reflecting raw query parameters."""
+    if flash_code not in message_map:
+        return ""
+    kind, text = message_map[flash_code]
+    bg_map = {
+        "success": ("#d4edda", "#155724", "#c3e6cb"),
+        "error": ("#f8d7da", "#721c24", "#f5c6cb"),
+        "info": ("#d1ecf1", "#0c5460", "#bee5eb"),
+    }
+    bg, fg, bd = bg_map.get(kind, ("#e2e3e5", "#383d41", "#d6d8db"))
+    return f'<div style="background:{bg}; color:{fg}; border:1px solid {bd}; border-radius:4px; padding:10px 12px; margin-bottom:15px; font-size:14px;">{html_lib.escape(text)}</div>'
+
+
+def read_update_status():
+    """Load persisted Git reinstall status metadata safely."""
+    status = DEFAULT_UPDATE_STATUS.copy()
+    if os.path.exists(UPDATE_STATUS_FILE):
+        try:
+            with open(UPDATE_STATUS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                status.update(loaded)
+        except Exception:
+            pass
+    return status
+
+
+def trigger_force_reinstall():
+    """Trigger decoupled root reinstall via sudo -n /usr/local/bin/mc-reinstall --async."""
+    if not os.path.exists(REINSTALL_BIN):
+        return "unavailable"
+    try:
+        res = subprocess.run(
+            ["sudo", "-n", REINSTALL_BIN, "--async"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "failed_launch"
+    if res.returncode == 0:
+        return "started"
+    if res.returncode == 2:
+        return "already_running"
+    stderr_lower = (res.stderr or "").lower()
+    if "password" in stderr_lower or "not allowed" in stderr_lower or "sudo" in stderr_lower:
+        return "unavailable"
+    return "failed_launch"
+
+
+def render_reinstall_card(update_status, flash_code=""):
+    """Render the Software Version & Force Reinstall Web UI card safely."""
+    status_val = str(update_status.get("status") or "UNKNOWN")
+    status_badge = _status_badge_html(status_val)
+    flash_html = _render_flash_banner(flash_code, UPDATE_FLASH_MESSAGES)
+    commit_short = html_lib.escape(str(update_status.get("commit_short") or "Unknown"))
+    commit_sha = html_lib.escape(str(update_status.get("commit_sha") or ""), quote=True)
+    commit_subj = html_lib.escape(str(update_status.get("commit_subject") or ""))
+    updated_utc = html_lib.escape(str(update_status.get("updated_utc") or "Never"))
+    trigger_src = html_lib.escape(str(update_status.get("trigger") or "N/A"))
+    message = html_lib.escape(str(update_status.get("message") or ""))
+    subj_line = f'<div class="stat-sub">{commit_subj}</div>' if commit_subj else ""
+
+    return f"""
+  <div class="card">
+    <h2>Software Version &amp; Force Reinstall {status_badge}</h2>
+    {flash_html}
+    <div class="grid-3" style="margin-bottom: 15px;">
+      <div class="stat-box">
+        <div class="stat-label">Installed Git Commit</div>
+        <div class="stat-val" title="{commit_sha}"><code>{commit_short}</code></div>
+        {subj_line}
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Last Update Status</div>
+        <div class="stat-val" style="font-size:15px;">{html_lib.escape(status_val)} ({trigger_src})</div>
+        <div class="stat-sub">Updated: {updated_utc}</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">SSH Command Equivalent</div>
+        <div class="stat-sub" style="margin-top:6px;"><code>sudo mc-reinstall</code></div>
+        <div class="stat-sub">Pin commit: <code>sudo mc-reinstall &lt;sha&gt;</code></div>
+      </div>
+    </div>
+    <p style="font-size:13px; color:#555; margin:0 0 12px 0;"><strong>Last Result:</strong> {message}</p>
+    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+      <form method="POST" action="/system/reinstall" style="margin:0;" onsubmit="return confirm('Run a full force reinstall from GitHub main? This backs up your world, stops Bedrock for 10 to 60 seconds, updates all scripts and the Web UI, and restarts services.');">
+        <button class="btn btn-warning" type="submit" style="margin:0;">Force Reinstall Latest from GitHub</button>
+      </form>
+      <a href="/" class="btn btn-primary" style="margin:0;">Refresh Status</a>
+    </div>
+    <small style="display:block; color:#777; margin-top:8px;">Note: Performs pre-reinstall world backup, bash/Python syntax validation, and automatic Web UI rollback on service failure.</small>
+  </div>
+    """
 
 
 def _render_address_report_html(address_cfg, report, props):
@@ -2579,12 +2939,7 @@ def render_address_management_card(address_cfg, props, flash_code=""):
     overall = report.get("overall_status", "NOT CONFIGURED") if isinstance(report, dict) else "NOT CONFIGURED"
     overall_badge = _status_badge_html(overall)
 
-    flash_html = ""
-    if flash_code in ADDRESS_FLASH_MESSAGES:
-        kind, text = ADDRESS_FLASH_MESSAGES[flash_code]
-        bg_map = {"success": ("#d4edda", "#155724", "#c3e6cb"), "error": ("#f8d7da", "#721c24", "#f5c6cb"), "info": ("#d1ecf1", "#0c5460", "#bee5eb")}
-        bg, fg, bd = bg_map.get(kind, ("#e2e3e5", "#383d41", "#d6d8db"))
-        flash_html = f'<div style="background:{bg}; color:{fg}; border:1px solid {bd}; border-radius:4px; padding:10px 12px; margin-bottom:15px; font-size:14px;">{html_lib.escape(text)}</div>'
+    flash_html = _render_flash_banner(flash_code, ADDRESS_FLASH_MESSAGES)
 
     escaped_raw = html_lib.escape(raw_addr, quote=True)
     has_saved = bool(host)
@@ -2692,10 +3047,13 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         stats = get_device_stats()
         backup_cfg = read_backup_config()
         address_cfg = read_address_config()
+        update_status = read_update_status()
         unified_players, default_role = get_unified_players()
         current_level_name = props.get("level-name", "Bedrock level")
         flash_code = query.get("addr_err", [""])[0] or query.get("addr_msg", [""])[0]
         address_card_html = render_address_management_card(address_cfg, props, flash_code=flash_code)
+        update_flash = query.get("update_msg", [""])[0]
+        reinstall_card_html = render_reinstall_card(update_status, flash_code=update_flash)
 
         status_color = "#28a745" if "ACTIVE" in status else "#dc3545"
 
@@ -2833,6 +3191,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     </form>
   </div>
   {address_card_html}
+  {reinstall_card_html}
 
   <div class="card">
     <h2>Device & Hardware Telemetry</h2>
@@ -3413,6 +3772,12 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", redirect_url)
             self.end_headers()
             return
+        elif path == "/system/reinstall":
+            code = trigger_force_reinstall()
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", f"/?update_msg={code}")
+            self.end_headers()
+            return
 
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", "/")
@@ -3474,7 +3839,7 @@ PYEOF
 
     # Configure bounded sudoers permissions for mcserver
     cat > "${sudoers_file}" << 'EOF'
-mcserver ALL=(ALL) NOPASSWD: /usr/bin/systemctl start minecraft-bedrock.service, /usr/bin/systemctl stop minecraft-bedrock.service, /usr/bin/systemctl restart minecraft-bedrock.service, /usr/bin/systemctl is-active minecraft-bedrock.service, /usr/local/bin/mc-backup, /usr/local/bin/mc-permission
+mcserver ALL=(ALL) NOPASSWD: /usr/bin/systemctl start minecraft-bedrock.service, /usr/bin/systemctl stop minecraft-bedrock.service, /usr/bin/systemctl restart minecraft-bedrock.service, /usr/bin/systemctl is-active minecraft-bedrock.service, /usr/local/bin/mc-backup, /usr/local/bin/mc-permission, /usr/local/bin/mc-reinstall --async
 EOF
     chmod 440 "${sudoers_file}"
 
@@ -3582,6 +3947,7 @@ main() {
     printf "   Storage   : sudo mc-set-storage <PATH>\n"
     printf "   Backup    : sudo mc-backup\n"
     printf "   Update    : sudo mc-update\n"
+    printf "   Reinstall : sudo mc-reinstall\n"
     printf "====================================================================\n"
 }
 

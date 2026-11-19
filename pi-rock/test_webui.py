@@ -361,6 +361,7 @@ class TestWebUIServerIntegration(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.auth_file = os.path.join(self.tmpdir.name, "auth.json")
         self.addr_file = os.path.join(self.tmpdir.name, "address_config.json")
+        self.update_status_file = os.path.join(self.tmpdir.name, "update_status.json")
         self.props_file = os.path.join(self.tmpdir.name, "server.properties")
         self.allow_file = os.path.join(self.tmpdir.name, "allowlist.json")
         self.perm_file = os.path.join(self.tmpdir.name, "permissions.json")
@@ -375,6 +376,7 @@ class TestWebUIServerIntegration(unittest.TestCase):
         self.patchers = [
             mock.patch.object(webui, "AUTH_FILE", self.auth_file),
             mock.patch.object(webui, "ADDRESS_CONFIG_FILE", self.addr_file),
+            mock.patch.object(webui, "UPDATE_STATUS_FILE", self.update_status_file),
             mock.patch.object(webui, "PROPERTIES_FILE", self.props_file),
             mock.patch.object(webui, "ALLOWLIST_FILE", self.allow_file),
             mock.patch.object(webui, "PERMISSIONS_FILE", self.perm_file),
@@ -487,6 +489,148 @@ class TestWebUIServerIntegration(unittest.TestCase):
         self.assertEqual(s_clr, 303)
         self.assertEqual(h_clr.get("Location"), "/?addr_msg=cleared")
         self.assertEqual(webui.read_address_config()["host"], "")
+
+    def test_system_reinstall_post_requires_auth_and_redirects(self):
+        # Arrange
+        with open(self.update_status_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "status": "SUCCESS",
+                "commit_sha": "288e5dd000000000000000000000000000000000",
+                "commit_short": "288e5dd",
+                "commit_subject": "feat: address <script>x</script>",
+                "updated_utc": "2026-11-19 16:30:00 UTC",
+                "trigger": "webui",
+                "message": "Done",
+            }, f)
+
+        # Act
+        s_unauth, _, _ = self._request("POST", "/system/reinstall", body="")
+        with mock.patch("webui.trigger_force_reinstall", return_value="started") as mock_trig:
+            s_post, h_post, _ = self._request("POST", "/system/reinstall", body="", headers=self.auth_headers)
+        s_get, _, html_body = self._request("GET", "/?update_msg=started", headers=self.auth_headers)
+
+        # Assert
+        self.assertEqual(s_unauth, 401)
+        mock_trig.assert_called_once()
+        self.assertEqual(s_post, 303)
+        self.assertEqual(h_post.get("Location"), "/?update_msg=started")
+        self.assertEqual(s_get, 200)
+        page = html_body.decode("utf-8")
+        self.assertIn("Software Version &amp; Force Reinstall", page)
+        self.assertIn("288e5dd", page)
+        self.assertIn("&lt;script&gt;x&lt;/script&gt;", page)
+        self.assertNotIn("<script>x</script>", page)
+        self.assertIn("Full GitHub reinstall started in the background.", page)
+
+
+class TestReinstallControlsAndInstallerSync(unittest.TestCase):
+    """Tests for update status reader, reinstall trigger, UI escaping, and installer sync."""
+
+    def test_read_update_status_defaults_valid_and_corrupt(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_path = os.path.join(tmpdir, "missing.json")
+            valid_path = os.path.join(tmpdir, "valid.json")
+            corrupt_path = os.path.join(tmpdir, "corrupt.json")
+            with open(valid_path, "w", encoding="utf-8") as f:
+                json.dump({"status": "SUCCESS", "commit_short": "abc1234"}, f)
+            with open(corrupt_path, "w", encoding="utf-8") as f:
+                f.write("{bad json")
+
+            # Act
+            with mock.patch.object(webui, "UPDATE_STATUS_FILE", missing_path):
+                d_res = webui.read_update_status()
+            with mock.patch.object(webui, "UPDATE_STATUS_FILE", valid_path):
+                v_res = webui.read_update_status()
+            with mock.patch.object(webui, "UPDATE_STATUS_FILE", corrupt_path):
+                c_res = webui.read_update_status()
+
+            # Assert
+            self.assertEqual(d_res["status"], "UNKNOWN")
+            self.assertEqual(d_res["commit_short"], "Unknown")
+            self.assertEqual(v_res["status"], "SUCCESS")
+            self.assertEqual(v_res["commit_short"], "abc1234")
+            self.assertEqual(c_res["status"], "UNKNOWN")
+
+    def test_trigger_force_reinstall_handles_all_outcomes(self):
+        # Arrange & Act & Assert
+        with mock.patch("webui.os.path.exists", return_value=False), \
+             mock.patch("webui.subprocess.run") as mock_run:
+            self.assertEqual(webui.trigger_force_reinstall(), "unavailable")
+            mock_run.assert_not_called()
+
+        cases = [
+            (mock.Mock(returncode=0, stderr=""), "started"),
+            (mock.Mock(returncode=2, stderr="locked"), "already_running"),
+            (mock.Mock(returncode=1, stderr="sudo: a password is required"), "unavailable"),
+            (mock.Mock(returncode=1, stderr="unexpected error"), "failed_launch"),
+        ]
+        for proc_res, exp_code in cases:
+            with self.subTest(exp_code=exp_code):
+                with mock.patch("webui.os.path.exists", return_value=True), \
+                     mock.patch("webui.subprocess.run", return_value=proc_res) as mock_run:
+                    code = webui.trigger_force_reinstall()
+                    self.assertEqual(code, exp_code)
+                    mock_run.assert_called_once_with(
+                        ["sudo", "-n", webui.REINSTALL_BIN, "--async"],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                    )
+
+        with mock.patch("webui.os.path.exists", return_value=True), \
+             mock.patch("webui.subprocess.run", side_effect=OSError("boom")):
+            self.assertEqual(webui.trigger_force_reinstall(), "failed_launch")
+
+    def test_render_reinstall_card_escapes_html_and_ignores_unknown_flash(self):
+        # Arrange
+        status = {
+            "status": "ROLLED_BACK",
+            "commit_sha": "deadbeef",
+            "commit_short": "deadbeef",
+            "commit_subject": "<img src=x onerror=alert(1)>",
+            "updated_utc": "2026-11-19 16:30:00 UTC",
+            "trigger": "cli",
+            "message": "Rolled back <b>now</b>",
+        }
+
+        # Act
+        card_html = webui.render_reinstall_card(status, flash_code="<script>bad</script>")
+
+        # Assert
+        self.assertIn("ROLLED_BACK", card_html)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", card_html)
+        self.assertIn("Rolled back &lt;b&gt;now&lt;/b&gt;", card_html)
+        self.assertNotIn("<img src=x", card_html)
+        self.assertNotIn("<script>bad</script>", card_html)
+
+    def test_installer_contains_mc_reinstall_sudoers_git_and_synced_webui(self):
+        # Arrange
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        sh_path = os.path.join(base_dir, "setup_bedrock_server.sh")
+        py_path = os.path.join(base_dir, "webui.py")
+        with open(sh_path, "rb") as f:
+            sh_bytes = f.read()
+        with open(py_path, "rb") as f:
+            py_bytes = f.read()
+        sh_text = sh_bytes.decode("utf-8")
+
+        # Act
+        start_marker = b"cat > \"${webui_script}\" << 'PYEOF'\r\n"
+        end_marker = b"\r\nPYEOF\r\n"
+        s = sh_bytes.index(start_marker) + len(start_marker)
+        e = sh_bytes.index(end_marker, s)
+        embedded = sh_bytes[s:e]
+
+        # Assert
+        self.assertEqual(embedded, py_bytes.rstrip(b"\r\n"))
+        self.assertIn("chmod 755 /usr/local/bin/mc-reinstall.tmp", sh_text)
+        self.assertIn("mv -f /usr/local/bin/mc-reinstall.tmp /usr/local/bin/mc-reinstall", sh_text)
+        self.assertIn("/usr/local/bin/mc-reinstall --async", sh_text)
+        sudoers_line = [ln for ln in sh_text.splitlines() if ln.startswith("mcserver ALL=(ALL) NOPASSWD:")]
+        self.assertEqual(len(sudoers_line), 1)
+        self.assertNotIn("*", sudoers_line[0])
+        self.assertIn("git", sh_text.split("install_system_dependencies()", 1)[1].split("}", 1)[0])
 
 
 if __name__ == "__main__":
