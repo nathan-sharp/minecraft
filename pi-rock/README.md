@@ -409,6 +409,12 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
 
 #### Features:
 - **Service Monitoring & Lifecycle**: Real-time daemon status with Start, Stop, Restart, and Backup triggers.
+- **Address & Connectivity Management**:
+  - Single-field configuration supporting Fully Qualified Domain Names (FQDN), public IPv4 addresses, and public IPv6 addresses with optional `:port` overrides.
+  - Automated eight-stage connectivity check triggered on address save and manual Re-check.
+  - Local verification of `minecraft-bedrock.service`, `/proc/net/udp` socket bindings, and local RakNet UDP ping responses.
+  - Public Domain Name System (DNS) resolution, Wide Area Network (WAN) IP matching, Cloudflare Proxy detection, and User Datagram Protocol (UDP) tunnel detection.
+  - External Bedrock reachability probes (IPv4 and IPv6) and external Web UI self-verification over Hypertext Transfer Protocol Secure (HTTPS) and Hypertext Transfer Protocol (HTTP).
 - **Hardware & System Telemetry**:
   - Primary root filesystem storage capacity, consumed space, free space, and utilization percentage.
   - World storage filesystem capacity, consumed space, free space, and mount path (identifies USB storage).
@@ -445,6 +451,33 @@ The toolkit deploys a lightweight, browser-based administration interface runnin
    - **Username**: `admin`
    - **Password**: Found in `/opt/minecraft/webui/auth.json` (printed during setup).
 4. Manage worlds, edit configuration, or update allowlists directly from the interface.
+
+#### Procedure: Configuring Custom Domain & External Connectivity Checks
+
+1. Open the **Address & Connectivity Management** card in the Web UI.
+2. Enter your custom domain or public IP address (optional `:port`).
+3. Click **Save & Check Connectivity**.
+4. Review the eight diagnostic stages in the results table.
+5. Resolve any `FAIL` or `WARN` items using the listed remediation steps.
+6. Click **Re-check Now** to re-run verification after router or DNS updates.
+
+| Stage | Target | Pass Criterion |
+| :--- | :--- | :--- |
+| **Bedrock Service Process** | `minecraft-bedrock.service` | Service reports active running state. |
+| **Local UDP Socket Binding** | `/proc/net/udp` and `/proc/net/udp6` | Configured `server-port` (default UDP `19132`) is bound. |
+| **Local RakNet Loopback** | `127.0.0.1` and `::1` | Local server returns a RakNet Unconnected Pong packet. |
+| **DNS & Public IP Validation** | DNS `A` and `AAAA` records | Address resolves strictly to public globally routable IPs. |
+| **WAN IP & Proxy Alignment** | Host public WAN IP | Matches WAN IP or active UDP tunnel; rejects Cloudflare Orange Cloud IPs. |
+| **External Bedrock UDP (IPv4)** | External RakNet scanner | External scanner receives RakNet pong matching local server GUID. |
+| **External Bedrock UDP (IPv6)** | External IPv6 RakNet scanner | Tested when an IPv6 literal or `AAAA` record exists. |
+| **External Web UI Reachability** | `https://<host>` and `http://<host>:8080` | `PASS` for verified Transport Layer Security (TLS) on port `443`; `WARN` for plaintext HTTP on port `8080`. |
+
+> [!WARNING]
+> **Security & External Endpoint Notice (OWASP ASVS V2, V4, V5, V9)**
+>
+> - **Plaintext HTTP Basic Authentication**: Never expose unencrypted port `8080` to the public WAN. Deploy a TLS reverse proxy or Cloudflare Tunnel on HTTPS port `443`.
+> - **Server-Side Request Forgery (SSRF) Defense**: The Web UI rejects private, loopback, link-local, Carrier-Grade NAT (CGNAT), and reserved IP targets before opening outbound sockets.
+> - **Third-Party Diagnostic Endpoints**: Saving or clicking **Re-check Now** sends outbound HTTPS requests to `api.ipify.org`, `ipv4.icanhazip.com`, `api6.ipify.org`, `api.mcstatus.io`, and `api.mcsrvstat.us`. Independently verify the availability and privacy posture of these external services before production use.
 
 ---
 
