@@ -783,6 +783,29 @@ class TestReinstallControlsAndInstallerSync(unittest.TestCase):
         self.assertIn("19132/tcp", fw_block)
         self.assertIn("19133/tcp", fw_block)
         self.assertIn("7551/udp", fw_block)
+        self.assertIn("sed -i '/^white-list=/d'", sh_text)
+
+    def test_legacy_whitelist_removed_on_save_and_flagged_in_diagnostics(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            props_path = os.path.join(tmpdir, "server.properties")
+            with open(props_path, "w", encoding="utf-8") as f:
+                f.write("server-port=19132\nallow-list=true\nwhite-list=true\n")
+
+            # Act
+            with mock.patch.object(webui, "PROPERTIES_FILE", props_path):
+                webui.save_properties({"allow-list": "false"})
+                updated = webui.read_properties()
+            with mock.patch("webui.read_allowlist", return_value=[]):
+                warn_chk = webui._check_allowlist_readiness({"allow-list": "false", "white-list": "true"})
+
+        # Assert
+        self.assertNotIn("white-list", webui.VALID_PROPERTIES)
+        self.assertIn("allow-list", webui.VALID_PROPERTIES)
+        self.assertEqual(updated.get("allow-list"), "false")
+        self.assertNotIn("white-list", updated)
+        self.assertEqual(warn_chk["status"], "WARN")
+        self.assertIn("white-list=true", warn_chk["detail"])
 
 
 if __name__ == "__main__":

@@ -134,7 +134,6 @@ VALID_PROPERTIES = {
     "allow-cheats": ["true", "false"],
     "max-players": int,
     "online-mode": ["true", "false"],
-    "white-list": ["true", "false"],
     "allow-list": ["true", "false"],
     "server-port": int,
     "server-portv6": int,
@@ -206,6 +205,8 @@ def save_properties(new_props):
         stripped = line.strip()
         if stripped and not stripped.startswith("#") and "=" in stripped:
             k = stripped.split("=", 1)[0].strip()
+            if k == "white-list" and "allow-list" in new_props:
+                continue
             if k in new_props:
                 output_lines.append(f"{k}={new_props[k]}\n")
                 keys_written.add(k)
@@ -1334,18 +1335,30 @@ def _check_local_raknet(prop_v4, prop_v6, lan_ip, v6_bound, transport):
 
 def _check_allowlist_readiness(props):
     """Warn operators if allowlist enforcement is enabled with zero players."""
-    enabled = str(props.get("allow-list", props.get("white-list", "false"))).strip().lower() == "true"
+    allow_on = str(props.get("allow-list", "false")).strip().lower() == "true"
+    white_on = str(props.get("white-list", "false")).strip().lower() == "true"
+    enabled = allow_on or white_on
     if not enabled:
         return _make_check("allowlist_readiness", "Access Policy", "Allowlist Readiness", "INFO", "Allowlist enforcement (allow-list) is disabled; any player with the address may join.")
     entries = read_allowlist()
+    legacy_note = " Legacy white-list=true in server.properties is overriding allow-list=false." if (white_on and not allow_on) else ""
     if len(entries) == 0:
         return _make_check(
             "allowlist_readiness",
             "Access Policy",
             "Allowlist Readiness",
             "WARN",
-            "Allowlist enforcement (allow-list=true) is enabled with 0 authorized players. All join attempts will be rejected.",
-            "Add your Xbox Gamertag under Player Access Control below, or set allow-list to false in server.properties.",
+            f"Allowlist enforcement is enabled with 0 authorized players. All join attempts will be rejected.{legacy_note}",
+            "Click Save Configuration & Apply in server.properties (removes legacy white-list=true), or add your Xbox Gamertag under Player Access Control.",
+        )
+    if white_on and not allow_on:
+        return _make_check(
+            "allowlist_readiness",
+            "Access Policy",
+            "Allowlist Readiness",
+            "WARN",
+            f"Legacy white-list=true is active alongside allow-list=false ({len(entries)} player(s) in allowlist.json).{legacy_note}",
+            "Click Save Configuration & Apply in server.properties to strip legacy white-list=true.",
         )
     return _make_check("allowlist_readiness", "Access Policy", "Allowlist Readiness", "PASS", f"Allowlist enforcement enabled with {len(entries)} authorized player(s).")
 
